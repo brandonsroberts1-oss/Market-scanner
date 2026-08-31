@@ -16,10 +16,75 @@ stays correct in future years without maintenance.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
+import logging
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
-EASTERN = ZoneInfo("America/New_York")
+log = logging.getLogger(__name__)
+
+
+def _nth_weekday_of(year: int, month: int, weekday: int, n: int) -> date:
+    """The nth `weekday` (0=Mon .. 6=Sun) of a month."""
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+class _USEasternFallback(tzinfo):
+    """US Eastern time without the IANA database.
+
+    Windows does not ship the IANA tz database, so `zoneinfo` there depends on
+    the `tzdata` package being installed. `tzdata` is in requirements.txt, but
+    this fallback means a missing or broken install degrades to a slightly less
+    authoritative clock instead of preventing the app from starting at all.
+
+    Implements the US rules in force since 2007: daylight time runs from the
+    second Sunday in March to the first Sunday in November. Both transitions
+    happen at 02:00 local, which is outside every market session (the earliest
+    is pre-market at 04:00), so the ambiguous hour cannot affect how a session
+    is classified.
+    """
+
+    _STD = timedelta(hours=-5)      # EST
+    _DST = timedelta(hours=1)
+
+    @staticmethod
+    def _bounds(year: int) -> tuple[datetime, datetime]:
+        start = _nth_weekday_of(year, 3, 6, 2)      # 2nd Sunday in March
+        end = _nth_weekday_of(year, 11, 6, 1)       # 1st Sunday in November
+        return (datetime(start.year, start.month, start.day, 2),
+                datetime(end.year, end.month, end.day, 2))
+
+    def utcoffset(self, dt):
+        return self._STD + self.dst(dt)
+
+    def dst(self, dt):
+        if dt is None:
+            return timedelta(0)
+        naive = dt.replace(tzinfo=None)
+        start, end = self._bounds(naive.year)
+        return self._DST if start <= naive < end else timedelta(0)
+
+    def tzname(self, dt):
+        return "EDT" if self.dst(dt) else "EST"
+
+    def __repr__(self):
+        return "US/Eastern (built-in fallback)"
+
+
+def _eastern_zone() -> tzinfo:
+    """Prefer the real IANA zone; fall back to the built-in rules."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
+    except Exception as exc:                                    # noqa: BLE001
+        log.warning(
+            "IANA time zone data unavailable (%s). Using built-in US Eastern "
+            "rules instead. Install the 'tzdata' package for the authoritative "
+            "database: pip install tzdata", exc,
+        )
+        return _USEasternFallback()
+
+
+EASTERN = _eastern_zone()
 
 PRE_OPEN = time(4, 0)
 REGULAR_OPEN = time(9, 30)

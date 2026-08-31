@@ -24,7 +24,7 @@ import launcher  # noqa: E402
 
 def test_launcher_uses_only_the_standard_library():
     """It runs before pip does, so a third-party import would be fatal."""
-    tree = ast.parse(LAUNCHER.read_text())
+    tree = ast.parse(LAUNCHER.read_text(encoding="utf-8"))
     imported = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -77,7 +77,7 @@ def test_venv_python_path_is_platform_correct():
 def test_launcher_refuses_to_run_from_the_wrong_folder(tmp_path):
     """The most common user error: launching from outside the extracted ZIP."""
     stray = tmp_path / "launcher.py"
-    stray.write_text(LAUNCHER.read_text())
+    stray.write_text(LAUNCHER.read_text(encoding="utf-8"), encoding="utf-8")
     result = subprocess.run([sys.executable, str(stray)], capture_output=True,
                             text=True, cwd=str(tmp_path), timeout=120)
     assert result.returncode == 1

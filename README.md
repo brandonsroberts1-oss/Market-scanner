@@ -66,6 +66,7 @@ The launcher checks for you and says so. Install Python 3.10 or newer from
 | Mac: *"cannot be opened because it is from an unidentified developer"* | Right-click `Start Market Scanner.command` → **Open** → **Open**. You only need to do this once. |
 | Mac: the file opens in a text editor instead of running | Open Terminal in the folder and run `chmod +x "Start Market Scanner.command"` once. |
 | "Could not install the dependencies" | Usually no internet, or a work firewall/proxy blocking `pypi.org`. Try another network. |
+| `ZoneInfoNotFoundError: 'No time zone found with key America/New_York'` | An old environment built before `tzdata` was added. Delete the `.venv` folder next to the launcher and run it again. |
 | The browser doesn't open on its own | Copy the `http://127.0.0.1:8000` address from the window into your browser. |
 | Port 8000 was busy | The launcher picks the next free port automatically and prints it — use that address. |
 

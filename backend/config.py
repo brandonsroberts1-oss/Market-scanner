@@ -12,7 +12,15 @@ def _load_dotenv() -> None:
     path = ROOT / ".env"
     if not path.exists():
         return
-    for line in path.read_text().splitlines():
+    # Explicit encoding: Windows defaults to cp1252, so a .env containing any
+    # non-ASCII character (a smart quote pasted from a web page, say) would
+    # otherwise raise at import time.
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        content = path.read_text(encoding="utf-8", errors="replace")
+
+    for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

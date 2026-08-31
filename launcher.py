@@ -146,6 +146,14 @@ def ensure_venv(venv_dir: Path) -> Path:
     return python
 
 
+def _read_text(path: Path) -> str:
+    """Read a file as UTF-8 regardless of the platform's default encoding."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _requirements_stamp() -> str:
     req = ROOT / "requirements.txt"
     return f"{req.stat().st_mtime_ns}:{req.stat().st_size}" if req.exists() else ""
@@ -155,7 +163,7 @@ def install_dependencies(python: Path, venv_dir: Path) -> None:
     """Install requirements, skipping the work when nothing has changed."""
     stamp_file = venv_dir / ".requirements-stamp"
     stamp = _requirements_stamp()
-    if stamp and stamp_file.exists() and stamp_file.read_text().strip() == stamp:
+    if stamp and stamp_file.exists() and _read_text(stamp_file).strip() == stamp:
         ok("Dependencies already installed.")
         return
 
@@ -177,21 +185,39 @@ def install_dependencies(python: Path, venv_dir: Path) -> None:
             raise SystemExit(1)
 
     try:
-        stamp_file.write_text(stamp)
+        stamp_file.write_text(stamp, encoding="utf-8")
     except OSError:
         pass
     ok("Dependencies installed.")
 
 
 def verify_install(python: Path) -> None:
+    """Import the real application before starting the server.
+
+    Catching an import failure here turns a wall of traceback into one readable
+    message. It also catches environment problems that only show up on some
+    platforms - a missing time zone database on Windows, for instance.
+    """
     check = subprocess.run(
-        [str(python), "-c", "import fastapi, uvicorn, httpx, numpy; print('ok')"],
+        [str(python), "-c",
+         "import fastapi, uvicorn, httpx, numpy; import backend.main; print('ok')"],
         capture_output=True, text=True, cwd=str(ROOT),
     )
-    if "ok" not in check.stdout:
-        fail("The dependencies did not import correctly.\n\n"
-             f"{(check.stderr or '').strip()[-1200:]}")
-        raise SystemExit(1)
+    if "ok" in check.stdout:
+        return
+
+    detail = (check.stderr or check.stdout or "").strip()
+    hint = ""
+    if "ZoneInfoNotFoundError" in detail or "No time zone found" in detail:
+        hint = ("\n\nThis is a missing time zone database. Reinstalling should fix "
+                "it:\n  delete the .venv folder next to this launcher, then run "
+                "the launcher again.")
+    elif "ModuleNotFoundError" in detail:
+        hint = ("\n\nA dependency is missing. Delete the .venv folder next to this "
+                "launcher and run it again to rebuild the environment.")
+
+    fail(f"The app could not start.\n\n{detail[-1200:]}{hint}")
+    raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------
