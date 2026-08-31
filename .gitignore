@@ -18,3 +18,7 @@ data/*.db-shm
 
 # OS
 .DS_Store
+
+# Local tooling
+node_modules/
+package-lock.json

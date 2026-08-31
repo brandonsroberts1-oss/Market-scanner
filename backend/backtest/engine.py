@@ -121,7 +121,17 @@ def _round_strike(price: float, spot: float) -> float:
 
 def _strike_for_delta(spot: float, vol: float, t: float, rate: float,
                       kind: str, target_delta: float) -> float:
-    """Invert Black-Scholes delta to find the strike, then snap to the grid."""
+    """The listed strike whose delta is closest to the target.
+
+    Real chains are quoted on a discrete grid, and for very short expiries that
+    grid is coarse relative to the expected move - at a $765 underlying with
+    2 DTE and 13% vol, consecutive $5 strikes are two-thirds of a standard
+    deviation apart, so a 0.15-delta contract may simply not be listed. Solving
+    for the continuous strike and rounding the *price* can therefore land on
+    the wrong side of the target; this compares the neighbouring listed strikes
+    by delta and takes the better one, which is what a trader reading the chain
+    would do.
+    """
     lo, hi = spot * 0.5, spot * 1.6
     for _ in range(60):
         mid = (lo + hi) / 2
@@ -138,7 +148,14 @@ def _strike_for_delta(spot: float, vol: float, t: float, rate: float,
                 hi = mid
             else:
                 lo = mid
-    return _round_strike((lo + hi) / 2, spot)
+
+    exact = (lo + hi) / 2
+    step = _strike_step(spot)
+    base = _round_strike(exact, spot)
+    candidates = [base - step, base, base + step]
+    valid = [k for k in candidates if k > 0]
+    return min(valid, key=lambda k: abs(
+        abs(bs.greeks(spot, k, t, rate, vol, kind).delta) - target_delta))
 
 
 @dataclass

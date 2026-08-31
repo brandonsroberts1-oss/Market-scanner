@@ -28,6 +28,11 @@ from .signals import Signals
 
 MULTIPLIER = 100.0
 
+# Structures whose theoretical maximum profit is not a realistic target
+# (it requires the underlying to go to zero, or to move without limit), so a
+# max-profit-over-max-loss ratio would be misleading for ranking.
+UNBOUNDED_TARGET_STRATEGIES = {"long_call", "long_put", "long_strangle", "long_straddle"}
+
 
 @dataclass
 class Leg:
@@ -69,6 +74,7 @@ class StrategyIdea:
     breakevens: list[float] = field(default_factory=list)
     prob_profit: float | None = None
     risk_reward: float | None = None
+    reward_at_expected_move: float | None = None
     ev_risk_neutral: float | None = None
     ev_model: float | None = None
 
@@ -309,7 +315,22 @@ def _finalise(idea: StrategyIdea, spot: float, vol: float, bias: float, rate: fl
     idea.ev_risk_neutral = metrics["ev_risk_neutral"]
     idea.ev_model = metrics["ev_model"]
 
-    if idea.max_profit is not None and idea.max_loss and idea.max_loss > 0:
+    # What the structure pays on a realistic one-sigma move in its favour.
+    # For a neutral structure the relevant case is the underlying going nowhere.
+    if idea.direction == "bullish":
+        target_spot = spot + idea.expected_move
+    elif idea.direction == "bearish":
+        target_spot = max(spot - idea.expected_move, 0.01)
+    else:
+        target_spot = spot
+    idea.reward_at_expected_move = round(payoff_at(idea.legs, target_spot), 2)
+
+    # Risk/reward is only meaningful when max profit is actually reachable.
+    # A long put's theoretical maximum assumes the underlying goes to zero, so
+    # quoting a 150:1 ratio off it would rank a lottery outcome as a great
+    # trade. Those structures are ranked on EV and one-sigma reward instead.
+    if (idea.max_profit is not None and idea.max_loss and idea.max_loss > 0
+            and idea.strategy not in UNBOUNDED_TARGET_STRATEGIES):
         idea.risk_reward = round(idea.max_profit / idea.max_loss, 2)
 
     idea.net_delta = round(_greeks_of(idea.legs)[0], 1)

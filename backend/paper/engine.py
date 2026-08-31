@@ -34,6 +34,11 @@ class OrderRejected(Exception):
     """Raised when an order cannot be accepted (funds, margin, bad symbol)."""
 
 
+class SessionNotFound(OrderRejected):
+    """Raised when a session id does not exist. Subclasses OrderRejected so
+    existing callers keep working, but the API maps it to a 404."""
+
+
 @dataclass
 class LegRequest:
     symbol: str                 # OCC contract symbol, or a plain ticker
@@ -71,7 +76,7 @@ def get_session(session_id: int) -> dict:
     with connect() as conn:
         row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if row is None:
-        raise OrderRejected(f"Session {session_id} not found.")
+        raise SessionNotFound(f"Session {session_id} not found.")
     return dict(row)
 
 

@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market Scanner</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📈</text></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand">Market<span>Scanner</span></div>
+  <nav>
+    <button data-view="dashboard" class="active">Dashboard</button>
+    <button data-view="scanner">Options Scanner</button>
+    <button data-view="equities">Equities &amp; Funds</button>
+    <button data-view="paper">Paper Trading</button>
+    <button data-view="backtest">Backtest</button>
+    <button data-view="history">Saved</button>
+  </nav>
+  <div class="status-chip" id="statusChip"><span class="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+
+<main>
+
+  <!-- ================= DASHBOARD ================= -->
+  <section class="view active" id="view-dashboard">
+    <div class="grid cols-4" id="indexTiles"></div>
+
+    <div class="card">
+      <h2>What may move the market <span class="sub" id="briefTime"></span></h2>
+      <p class="prose" id="narrative">Loading…</p>
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Top headlines <span class="sub">scored for tone and impact</span></h2>
+        <div id="headlines"><div class="loading"><div class="spinner"></div>Loading headlines…</div></div>
+      </div>
+      <div class="card">
+        <h2>Scheduled catalysts <span class="sub">next 10 days</span></h2>
+        <div id="catalysts"><div class="loading"><div class="spinner"></div>Loading…</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCANNER ================= -->
+  <section class="view" id="view-scanner">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>Universe</label>
+          <select id="scanPreset">
+            <option value="core">Core (indices + mega caps)</option>
+            <option value="etfs">ETFs &amp; sectors</option>
+            <option value="megacap">Mega cap</option>
+            <option value="highbeta">High beta</option>
+            <option value="wide">Wide (all tracked)</option>
+          </select>
+        </div>
+        <div class="field"><label>Min DTE</label><input type="number" id="scanMinDte" value="0" min="0" max="60" style="width:74px"></div>
+        <div class="field"><label>Max DTE</label><input type="number" id="scanMaxDte" value="3" min="0" max="60" style="width:74px"></div>
+        <div class="field"><label>Min conviction</label><input type="number" id="scanMinConv" value="35" min="0" max="100" style="width:88px"></div>
+        <div class="field"><label>Custom tickers</label><input type="text" id="scanCustom" placeholder="e.g. SPY,NVDA,AMD" style="width:190px"></div>
+        <div class="spacer"></div>
+        <button class="btn primary" id="runScan">Run scan</button>
+        <button class="btn" id="saveScan" title="Store this scan so you can review it later">Save result</button>
+      </div>
+    </div>
+
+    <div class="info-box" id="scanNote" hidden></div>
+    <div class="card">
+      <h2>Options opportunities <span class="sub" id="scanMeta"></span></h2>
+      <div class="table-wrap"><table id="scanTable">
+        <thead><tr>
+          <th>Symbol</th><th>Strategy</th><th>Bias</th><th>Conviction</th>
+          <th class="num">DTE</th><th class="num">Net cost</th><th class="num">Max profit</th>
+          <th class="num">Max loss</th><th class="num">R:R</th><th class="num">POP</th>
+          <th class="num">EV (model)</th><th>IV</th><th>Regime</th><th></th>
+        </tr></thead>
+        <tbody id="scanBody"><tr><td colspan="14"><div class="empty">Run a scan to find opportunities.</div></td></tr></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= EQUITIES ================= -->
+  <section class="view" id="view-equities">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>Universe</label>
+          <select id="eqPreset">
+            <option value="core">Core</option><option value="etfs">ETFs &amp; sectors</option>
+            <option value="megacap">Mega cap</option><option value="highbeta">High beta</option>
+            <option value="wide">Wide</option>
+          </select>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn primary" id="runEquities">Scan equities &amp; funds</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Ranked equities and funds <span class="sub" id="eqMeta"></span></h2>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Symbol</th><th>Type</th><th>Side</th><th class="num">Score</th><th>Trend</th>
+          <th class="num">Price</th><th class="num">Chg %</th><th class="num">Entry</th>
+          <th class="num">Stop</th><th class="num">Target</th><th class="num">R:R</th>
+          <th class="num">ATR %</th><th class="num">RSI</th><th class="num">Sharpe 60d</th><th></th>
+        </tr></thead>
+        <tbody id="eqBody"><tr><td colspan="15"><div class="empty">Run a scan to rank equities and funds.</div></td></tr></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= PAPER ================= -->
+  <section class="view" id="view-paper">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>Session</label><select id="sessionSelect" style="min-width:280px"></select></div>
+        <button class="btn primary" id="newSessionBtn">New session</button>
+        <button class="btn" id="refreshPaper">Refresh marks</button>
+        <button class="btn" id="settleBtn" title="Settle expired contracts to intrinsic value">Settle expiries</button>
+        <div class="spacer"></div>
+        <button class="btn" id="closeSessionBtn">Close session</button>
+        <button class="btn danger" id="deleteSessionBtn">Delete</button>
+      </div>
+    </div>
+
+    <div class="grid cols-4" id="paperStats"></div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Equity curve</h2>
+        <svg class="chart chart-tall" id="equityChart"></svg>
+      </div>
+      <div class="card">
+        <h2>Performance <span class="sub">closed round trips</span></h2>
+        <div id="perfStats"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Open positions</h2>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Symbol</th><th>Type</th><th class="num">Qty</th><th class="num">Avg price</th>
+          <th class="num">Mark</th><th class="num">Value</th><th class="num">Unrealized</th>
+          <th class="num">%</th><th class="num">DTE</th><th>Strategy</th><th></th>
+        </tr></thead>
+        <tbody id="positionsBody"></tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <h2>Order history <span class="sub">every fill, saved</span></h2>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th>
+          <th class="num">Fill</th><th class="num">Comm.</th><th class="num">Realized</th>
+          <th>Strategy</th><th>Note</th>
+        </tr></thead>
+        <tbody id="ordersBody"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= BACKTEST ================= -->
+  <section class="view" id="view-backtest">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>Symbols</label><input type="text" id="btSymbols" value="SPY,QQQ,AAPL,NVDA" style="width:230px"></div>
+        <div class="field"><label>Mode</label><select id="btMode"><option value="options">Options</option><option value="equity">Equity</option></select></div>
+        <div class="field"><label>Lookback (days)</label><input type="number" id="btLookback" value="400" min="120" max="800" style="width:100px"></div>
+        <div class="field"><label>Hold (days)</label><input type="number" id="btHold" value="3" min="1" max="15" style="width:84px"></div>
+        <div class="field"><label>DTE</label><input type="number" id="btDte" value="3" min="1" max="45" style="width:70px"></div>
+        <div class="field"><label>Min conviction</label><input type="number" id="btConv" value="55" min="0" max="100" style="width:92px"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>Starting cash</label><input type="number" id="btCash" value="25000" min="1000" step="1000" style="width:110px"></div>
+        <div class="field"><label>Profit target %</label><input type="number" id="btTarget" value="60" min="1" max="500" style="width:96px"></div>
+        <div class="field"><label>Stop loss %</label><input type="number" id="btStop" value="50" min="1" max="100" style="width:92px"></div>
+        <div class="field"><label>IV premium</label><input type="number" id="btIvPrem" value="1.15" min="0.5" max="3" step="0.05" style="width:88px"></div>
+        <div class="field"><label>Spread %</label><input type="number" id="btSpread" value="4" min="0" max="50" step="0.5" style="width:80px"></div>
+        <div class="field"><label>Risk / trade %</label><input type="number" id="btRisk" value="5" min="0.5" max="100" step="0.5" style="width:96px"></div>
+        <div class="spacer"></div>
+        <button class="btn primary" id="runBacktest">Run backtest</button>
+      </div>
+    </div>
+
+    <div id="btMethod"></div>
+    <div class="grid cols-4" id="btStats"></div>
+    <div class="card" id="btCurveCard" hidden>
+      <h2>Equity curve</h2>
+      <svg class="chart chart-tall" id="btChart"></svg>
+    </div>
+    <div class="card" id="btTradesCard" hidden>
+      <h2>Trades</h2>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Entry</th><th>Exit</th><th>Symbol</th><th>Strategy</th><th class="num">Conv</th>
+          <th class="num">Cost</th><th class="num">P&amp;L</th><th class="num">%</th>
+          <th class="num">Underlying</th><th>Exit reason</th>
+        </tr></thead>
+        <tbody id="btBody"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= SAVED ================= -->
+  <section class="view" id="view-history">
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Saved scans</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>When</th><th>Label</th><th></th></tr></thead>
+          <tbody id="savedScansBody"></tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <h2>Saved backtests</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>When</th><th>Label</th><th></th></tr></thead>
+          <tbody id="savedBtBody"></tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="card" id="savedDetailCard" hidden>
+      <h2 id="savedDetailTitle">Detail</h2>
+      <div id="savedDetail"></div>
+    </div>
+  </section>
+
+  <div class="disclaimer">
+    <strong>This is analysis software, not advice.</strong> Conviction scores rank how well a setup
+    matches historically-studied conditions; they are not predictions and they are wrong regularly.
+    Short-dated options can lose their entire value in a single session. Expected values marked
+    <em>model</em> assume the scanner's directional read is correct — which is exactly the thing being
+    assumed. Backtested option P&amp;L is modelled with Black-Scholes rather than replayed from
+    historical chains. Paper trading fills cross part of the spread but cannot reproduce real
+    queue position, partial fills, or a fast tape. Verify every price with your broker before trading.
+  </div>
+</main>
+
+<dialog id="sessionDialog">
+  <h3>New paper trading session</h3>
+  <div class="field" style="margin-bottom:12px"><label>Session name</label><input type="text" id="dlgName" placeholder="e.g. September 0DTE test"></div>
+  <div class="field" style="margin-bottom:12px"><label>Starting cash (USD)</label><input type="number" id="dlgCash" value="25000" min="100" step="500"></div>
+  <div class="field" style="margin-bottom:16px"><label>Notes (optional)</label><textarea id="dlgNotes" rows="2" placeholder="What are you testing?"></textarea></div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn" id="dlgCancel">Cancel</button>
+    <button class="btn primary" id="dlgCreate">Create session</button>
+  </div>
+</dialog>
+
+<dialog id="tradeDialog">
+  <h3 id="tradeTitle">Paper trade</h3>
+  <div id="tradeSummary" class="prose dim tiny" style="margin-bottom:12px"></div>
+  <div class="field" style="margin-bottom:12px"><label>Session</label><select id="tradeSession"></select></div>
+  <div class="field" style="margin-bottom:16px"><label>Contracts (multiplies every leg)</label><input type="number" id="tradeQty" value="1" min="1" max="500"></div>
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn" id="tradeCancel">Cancel</button>
+    <button class="btn primary" id="tradeConfirm">Place paper order</button>
+  </div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

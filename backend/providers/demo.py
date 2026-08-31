@@ -143,11 +143,19 @@ class DemoProvider:
         return sorted(set(out))
 
     async def chain(self, symbol: str, expiration: str) -> OptionChain | None:
+        # Only quote expirations this provider actually lists, the way a real
+        # vendor does. Fabricating a chain for an unlisted date would hide bugs
+        # in callers that pass a stale or malformed expiry.
+        if expiration not in await self.expirations(symbol):
+            return None
         q = (await self.quotes([symbol])).get(symbol.upper())
         if q is None:
             return None
         spot = q.last
-        exp = date.fromisoformat(expiration)
+        try:
+            exp = date.fromisoformat(expiration)
+        except ValueError:
+            return None
         dte = max((exp - self.as_of).days, 0)
         t = max(dte, 0.35) * bs.DAY          # intraday floor so 0DTE still prices
         _, base_vol, _ = _profile(symbol)

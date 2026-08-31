@@ -225,7 +225,11 @@ def sharpe(returns, periods_per_year: int = 252, risk_free: float = 0.0) -> floa
     if len(r) < 2:
         return float("nan")
     excess = r - risk_free / periods_per_year
-    sd = excess.std(ddof=1)
-    if sd == 0:
+    sd = float(excess.std(ddof=1))
+    # Guard against a standard deviation that is only non-zero through floating
+    # point noise: dividing by 1e-18 yields a Sharpe of 1e16, which would be
+    # reported as a real statistic.
+    scale = max(abs(float(excess.mean())), 1.0)
+    if sd <= scale * 1e-12:
         return float("nan")
     return float(excess.mean() / sd * np.sqrt(periods_per_year))
