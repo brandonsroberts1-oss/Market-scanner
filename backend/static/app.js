@@ -380,7 +380,7 @@ function drawPayoff(svg, idea) {
 function drawLine(svg, xs, ys, opts = {}) {
   const w = svg.clientWidth || 560;
   const h = svg.clientHeight || 190;
-  const pad = { l: 52, r: 12, t: 12, b: 22 };
+  const pad = { l: 58, r: 12, t: 12, b: 22 };
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   let yMin = Math.min(...ys), yMax = Math.max(...ys);
   if (yMin === yMax) { yMin -= 1; yMax += 1; }
@@ -390,18 +390,40 @@ function drawLine(svg, xs, ys, opts = {}) {
   const X = (v) => pad.l + (v - xMin) / (xMax - xMin || 1) * (w - pad.l - pad.r);
   const Y = (v) => h - pad.b - (v - yMin) / (yMax - yMin || 1) * (h - pad.t - pad.b);
 
+  // Tick labels are formatted from the *range*, not the absolute value. An
+  // equity curve running 99,978 -> 100,004 would otherwise print "100.0k" on
+  // every gridline, and intraday snapshots would all print the same date.
+  const yRange = yMax - yMin;
+  const fmtY = (v) => {
+    if (yRange >= 20000) return (v / 1000).toFixed(0) + 'k';
+    if (yRange >= 2000) return (v / 1000).toFixed(1) + 'k';
+    if (yRange >= 100) return v.toFixed(0);
+    if (yRange >= 10) return v.toFixed(1);
+    return v.toFixed(2);
+  };
+
+  const isTime = xMax > 1e11;                    // epoch milliseconds
+  const spanDays = isTime ? (xMax - xMin) / 86400000 : 0;
+  const fmtX = (v) => {
+    if (!isTime) return v.toFixed(0);
+    const d = new Date(v);
+    if (spanDays <= 2) return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    if (spanDays <= 400) return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
+  };
+
   const parts = [];
   // horizontal gridlines + y labels
   for (let i = 0; i <= 4; i++) {
-    const v = yMin + (yMax - yMin) * (i / 4);
+    const v = yMin + yRange * (i / 4);
     const y = Y(v);
     parts.push(`<line x1="${pad.l}" y1="${y}" x2="${w - pad.r}" y2="${y}" stroke="#262c3d" stroke-width="1"/>`);
-    parts.push(`<text x="${pad.l - 6}" y="${y + 3.5}" fill="#5c6478" font-size="9.5" text-anchor="end" font-family="ui-monospace,monospace">${Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0)}</text>`);
+    parts.push(`<text x="${pad.l - 6}" y="${y + 3.5}" fill="#5c6478" font-size="9.5" text-anchor="end" font-family="ui-monospace,monospace">${fmtY(v)}</text>`);
   }
   // x labels
   for (let i = 0; i <= 4; i++) {
     const v = xMin + (xMax - xMin) * (i / 4);
-    parts.push(`<text x="${X(v)}" y="${h - 6}" fill="#5c6478" font-size="9.5" text-anchor="middle" font-family="ui-monospace,monospace">${xMax > 3000 ? new Date(v).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : v.toFixed(0)}</text>`);
+    parts.push(`<text x="${X(v)}" y="${h - 6}" fill="#5c6478" font-size="9.5" text-anchor="middle" font-family="ui-monospace,monospace">${fmtX(v)}</text>`);
   }
   if (opts.zeroLine && yMin < 0 && yMax > 0) {
     parts.push(`<line x1="${pad.l}" y1="${Y(0)}" x2="${w - pad.r}" y2="${Y(0)}" stroke="#5c6478" stroke-width="1" stroke-dasharray="3,3"/>`);

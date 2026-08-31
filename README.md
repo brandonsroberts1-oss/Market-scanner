@@ -9,6 +9,7 @@ Built for the 0–3 day horizon: same-day and few-day expiries, where liquidity
 and time decay matter as much as direction.
 
 ![Dashboard](docs/screenshot-dashboard.png)
+*Market overview: index tiles, a plain-language read of the tape, headlines scored for tone and impact, and the scheduled catalyst calendar.*
 
 ---
 
@@ -20,6 +21,9 @@ constructs the structures that fit that read — long calls/puts, debit vertical
 credit verticals, iron condors, strangles. Each idea comes priced against the
 actual bid/ask with max profit, max loss, breakevens, probability of profit,
 expected value, and a written rationale, risk note and exit plan.
+
+![Options scanner](docs/screenshot-scanner.png)
+*Every idea expands into its rationale, risk note, exit plan, payoff diagram, contract table and the full factor breakdown behind its score.*
 
 **Conviction scores you can audit.** Every score decomposes into nine weighted
 factors, each with a sentence explaining what it saw ("RSI(14) at 74 —
@@ -45,6 +49,9 @@ exactly what you did.
 **Backtesting.** Replays the same scoring rules over history with strict
 no-lookahead, sizing off running equity so a losing run cannot compound past
 a total loss.
+
+![Paper trading](docs/screenshot-paper.png)
+*A paper session started with $100,000: live marks, equity curve, open positions, closed-trade statistics and the full order history.*
 
 ---
 
@@ -260,6 +267,9 @@ The front end is a thin client over a documented REST API — interactive docs a
 | `GET` | `/api/scan/saved`, `/api/backtest/saved` | stored results |
 
 ---
+
+![Backtest](docs/screenshot-backtest.png)
+*Backtest results always state their method above the numbers.*
 
 ## Tests
 
