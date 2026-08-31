@@ -9,6 +9,10 @@ off this feed:
   * Option chains are typically delayed ~15 minutes.
   * Yahoo's own `impliedVolatility` is often stale, so this module re-solves IV
     from the current bid/ask midpoint and computes greeks itself.
+
+Extended hours are supported: the batched quote endpoint carries explicit
+pre- and post-market prices with their own timestamps, which are kept separate
+from the regular-session price rather than overwriting it.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ from datetime import date, datetime, timezone
 
 import httpx
 
+from .. import market_hours
 from ..analytics import blackscholes as bs
 from .base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote
 
@@ -88,27 +93,99 @@ class YahooProvider:
 
     # -- quotes -------------------------------------------------------------
     async def quotes(self, symbols: list[str]) -> dict[str, Quote]:
-        """One chart call per symbol, run concurrently.
+        """Batched quote lookup, including pre- and post-market prices.
 
-        The chart endpoint is used rather than /v7/finance/quote because it
-        stays available without a crumb far more often and carries the same
-        fields in `meta`.
+        The v7 quote endpoint returns every symbol in one request and is the
+        only Yahoo endpoint that exposes `preMarketPrice` / `postMarketPrice`
+        directly. If it is unavailable the chart endpoint is used per symbol,
+        which still yields extended-hours prices from the pre/post bars.
         """
-        results = await asyncio.gather(
-            *(self._quote_one(s) for s in symbols), return_exceptions=True
-        )
+        if not symbols:
+            return {}
+
         out: dict[str, Quote] = {}
-        for sym, res in zip(symbols, results):
-            if isinstance(res, Quote):
-                out[sym.upper()] = res
-            elif isinstance(res, Exception):
-                log.debug("yahoo quote %s failed: %s", sym, res)
+        data = await self._get_json(
+            "https://query1.finance.yahoo.com/v7/finance/quote",
+            {"symbols": ",".join(symbols)}, crumb=True,
+        )
+        rows = ((data or {}).get("quoteResponse") or {}).get("result") or []
+        for row in rows:
+            quote = self._quote_from_v7(row)
+            if quote:
+                out[quote.symbol] = quote
+
+        missing = [s for s in symbols if s.upper() not in out]
+        if missing:
+            results = await asyncio.gather(
+                *(self._quote_from_chart(s) for s in missing), return_exceptions=True
+            )
+            for sym, res in zip(missing, results):
+                if isinstance(res, Quote):
+                    out[sym.upper()] = res
+                elif isinstance(res, Exception):
+                    log.debug("yahoo quote %s failed: %s", sym, res)
         return out
 
-    async def _quote_one(self, symbol: str) -> Quote | None:
+    @staticmethod
+    def _iso(epoch) -> str | None:
+        if not epoch:
+            return None
+        try:
+            return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _quote_from_v7(self, row: dict) -> Quote | None:
+        symbol = row.get("symbol")
+        last = row.get("regularMarketPrice")
+        if not symbol or last is None:
+            return None
+
+        # Yahoo's marketState uses its own vocabulary; normalise it to the
+        # session names the rest of the app speaks.
+        state = str(row.get("marketState", "")).upper()
+        session = {
+            "PRE": market_hours.PRE, "PREPRE": market_hours.CLOSED,
+            "REGULAR": market_hours.REGULAR,
+            "POST": market_hours.AFTER, "POSTPOST": market_hours.CLOSED,
+            "CLOSED": market_hours.CLOSED,
+        }.get(state) or market_hours.session()
+
+        extended = extended_time = None
+        if session == market_hours.PRE and row.get("preMarketPrice") is not None:
+            extended = float(row["preMarketPrice"])
+            extended_time = self._iso(row.get("preMarketTime"))
+        elif session == market_hours.AFTER and row.get("postMarketPrice") is not None:
+            extended = float(row["postMarketPrice"])
+            extended_time = self._iso(row.get("postMarketTime"))
+        elif row.get("postMarketPrice") is not None and session == market_hours.CLOSED:
+            # Market fully closed: the last post-market print is still the most
+            # recent trade, so show it rather than pretending it did not happen.
+            extended = float(row["postMarketPrice"])
+            extended_time = self._iso(row.get("postMarketTime"))
+
+        return Quote(
+            symbol=symbol.upper(), last=float(last),
+            bid=row.get("bid") or None, ask=row.get("ask") or None,
+            previous_close=row.get("regularMarketPreviousClose"),
+            open=row.get("regularMarketOpen"), high=row.get("regularMarketDayHigh"),
+            low=row.get("regularMarketDayLow"), volume=row.get("regularMarketVolume"),
+            timestamp=self._iso(row.get("regularMarketTime")),
+            name=row.get("shortName") or row.get("longName"),
+            delayed=False, extended_last=extended, extended_timestamp=extended_time,
+            market_session=session,
+        )
+
+    async def _quote_from_chart(self, symbol: str) -> Quote | None:
+        """Fallback quote path, still extended-hours aware.
+
+        The chart endpoint has no pre/post fields, but with includePrePost it
+        returns bars outside the regular trading period; the latest of those is
+        the extended-hours price.
+        """
         data = await self._get_json(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            {"range": "5d", "interval": "1d", "includePrePost": "false"},
+            {"range": "5d", "interval": "1m", "includePrePost": "true"},
         )
         try:
             result = data["chart"]["result"][0]
@@ -121,13 +198,19 @@ class YahooProvider:
             return None
         prev = meta.get("chartPreviousClose") or meta.get("previousClose")
 
-        # Fill OHLC from the most recent complete daily bar.
-        o = h = l = v = None
+        extended = extended_time = None
+        period = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+        regular_end = period.get("end")
         try:
-            q = result["indicators"]["quote"][0]
-            for i in range(len(q["close"]) - 1, -1, -1):
-                if q["close"][i] is not None:
-                    o, h, l, v = q["open"][i], q["high"][i], q["low"][i], q["volume"][i]
+            stamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
+            if regular_end:
+                for i in range(len(stamps) - 1, -1, -1):
+                    if closes[i] is None:
+                        continue
+                    if stamps[i] > regular_end:
+                        extended = float(closes[i])
+                        extended_time = self._iso(stamps[i])
                     break
         except (TypeError, KeyError, IndexError):
             pass
@@ -137,12 +220,12 @@ class YahooProvider:
             symbol=symbol.upper(), last=float(last),
             bid=meta.get("bid"), ask=meta.get("ask"),
             previous_close=float(prev) if prev else None,
-            open=o, high=meta.get("regularMarketDayHigh", h),
-            low=meta.get("regularMarketDayLow", l),
-            volume=meta.get("regularMarketVolume", v),
-            timestamp=(datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None),
+            open=meta.get("regularMarketOpen"), high=meta.get("regularMarketDayHigh"),
+            low=meta.get("regularMarketDayLow"), volume=meta.get("regularMarketVolume"),
+            timestamp=self._iso(ts),
             name=meta.get("shortName") or meta.get("longName"),
-            delayed=False,
+            delayed=False, extended_last=extended, extended_timestamp=extended_time,
+            market_session=market_hours.session(),
         )
 
     # -- history ------------------------------------------------------------
@@ -185,6 +268,14 @@ class YahooProvider:
         return [datetime.fromtimestamp(s, timezone.utc).date().isoformat() for s in stamps]
 
     async def chain(self, symbol: str, expiration: str) -> OptionChain | None:
+        # Only ever quote an expiration the vendor lists. Asking Yahoo for a
+        # date that is not a real expiry returns the nearest one instead, which
+        # would silently mislabel the whole chain.
+        listed = await self.expirations(symbol)
+        if listed and expiration not in listed:
+            log.debug("%s is not a listed expiration for %s", expiration, symbol)
+            return None
+
         epoch = int(datetime.combine(
             date.fromisoformat(expiration), datetime.min.time(), timezone.utc
         ).timestamp())

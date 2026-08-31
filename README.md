@@ -75,21 +75,19 @@ does the same thing. For more detail while troubleshooting, set
 
 ### Getting live data
 
-With no configuration the app starts on the offline simulator, so you can
-explore every screen immediately — but **those prices are generated, not real**,
-and the header says so in red.
+The app needs a live data provider. With no configuration it uses Yahoo
+Finance, which needs no API key. Copy `.env.example` to `.env` to change it:
 
-Copy `.env.example` to `.env` and pick a provider:
-
-| Provider | Key needed | Equity quotes | Option chains | Greeks |
-|---|---|---|---|---|
-| **Tradier** *(recommended)* | free token | real-time¹ | real-time¹ | exchange-published |
-| **Yahoo** *(default, no key)* | none | near-real-time | ~15 min delayed | computed locally |
-| **Demo** | none | simulated | simulated | computed locally |
+| Provider | Key needed | Equity quotes | Extended hours | Option chains | Greeks |
+|---|---|---|---|---|---|
+| **Tradier** *(recommended)* | free token | real-time¹ | yes | real-time¹ | exchange-published |
+| **Yahoo** *(default, no key)* | none | near-real-time | yes | ~15 min delayed | computed locally |
 
 ¹ A Tradier *sandbox* token returns delayed data. Real-time requires a
 brokerage account token. The app reports which it is in the status chip and
 never claims data is live when it isn't.
+
+There is no offline or demo provider. See **Where the numbers come from** below.
 
 ```bash
 # .env
@@ -146,7 +144,49 @@ a total loss.
 *A paper session started with $100,000: live marks, equity curve, open positions, closed-trade statistics and the full order history.*
 
 ![Dashboard](docs/screenshot-dashboard.png)
-*Market overview: index tiles, a plain-language read of the tape, headlines scored for tone and impact, and the scheduled catalyst calendar.*
+*Market overview during the after-hours session: each tile shows the regular close with the day's change, and the post-market price with its move from that close underneath. STALE badges appear when a provider could not be refreshed — those are the last real prices fetched, never generated ones.*
+
+---
+
+## Where the numbers come from
+
+**Every price shown is a price that actually traded.** The app has no simulator
+and no demo mode; there is no configuration that will put a generated number in
+front of you. `MARKET_DATA_PROVIDER=demo` is rejected at startup with an error.
+
+When a provider cannot be reached, the app shows **the most recent real data it
+already fetched**, marked `STALE` with its age, rather than inventing a price or
+showing a blank screen. If a symbol has never been fetched successfully it is
+listed as having no data — again, never filled in with a guess.
+
+This matters beyond the prices themselves. A simulated feed once generated an
+expiration for every weekday, which produced a Tuesday 1 September expiry for
+AAPL — a contract that does not exist. Expiration dates now come only from the
+vendor's own list, and asking for a date the vendor does not list returns
+nothing instead of a chain quietly labelled with the wrong expiry.
+
+### Extended hours
+
+Many exchanges trade outside 09:30–16:00 ET, so the app tracks the session and
+keeps the two prices apart:
+
+* `last` is always the **regular-session** price — the last trade during normal
+  hours, or the official close once the session has ended.
+* `extended_last` is the **pre- or post-market** print, with its own timestamp.
+
+A 4:30pm trade is therefore never presented as the closing price. The dashboard
+shows the regular close with the day's change, and the after-hours price with
+its move *from that close* underneath — the way a broker displays it. Positions
+are marked against the most recent trade in either session.
+
+Sessions (Eastern): pre-market 04:00–09:30, regular 09:30–16:00, after-hours
+16:00–20:00. Holidays and 13:00 early closes are computed from the NYSE rules,
+so the calendar stays correct without maintenance.
+
+Provider support: Yahoo exposes explicit `preMarketPrice` / `postMarketPrice`
+fields. Tradier reports a single last-trade price that silently includes
+extended prints, so the app splits it using the session clock and the `close` /
+`prevclose` reference prices the payload carries.
 
 ---
 
@@ -256,9 +296,9 @@ pays commission and half-spread slippage both ways.
 Treat the output as a sanity check on whether a rule has any edge at all, not
 as a forecast of returns. The UI states the method above every result.
 
-A useful check: run it against the demo provider, whose prices are a random
-walk with no predictable structure. The strategies lose money there, roughly by
-the transaction costs — which is what an unbiased backtester should show, and
+The test suite runs the backtester over a random-walk price series with no
+predictable structure. The strategies lose money there, roughly by the
+transaction costs — which is what an unbiased backtester should show, and
 evidence that no lookahead is inflating results.
 
 ---
@@ -275,6 +315,7 @@ run.sh                        terminal equivalent
 backend/
 ├── main.py               FastAPI app and all routes
 ├── config.py             env/.env settings
+├── market_hours.py       US sessions, NYSE holidays, early closes
 ├── db.py                 SQLite schema and connection helpers
 ├── analytics/
 │   ├── blackscholes.py   pricing, greeks, IV solve, probabilities
@@ -283,8 +324,8 @@ backend/
 │   ├── base.py           normalised Quote/Bar/OptionChain types
 │   ├── yahoo.py          free provider (cookie+crumb bootstrap)
 │   ├── tradier.py        real-time provider with greeks
-│   ├── demo.py           deterministic offline simulator
-│   └── registry.py       TTL cache, single-flight, fallback
+│   ├── store.py          last-known-good real data (never simulated)
+│   └── registry.py       TTL cache, single-flight, staleness
 ├── engine/
 │   ├── universe.py       scan universes
 │   ├── signals.py        measurement only
@@ -336,12 +377,18 @@ The front end is a thin client over a documented REST API — interactive docs a
 .venv/bin/python -m pytest tests/ -q
 ```
 
-140 tests, no network and no API key required — everything runs against the
-deterministic simulator. They cover Black-Scholes against textbook values and a
-real broker quote, indicator maths, structure arithmetic checked by hand,
-expected-value calibration, margin rules for every spread type, fill and
-settlement mechanics, no-lookahead guarantees in the backtester, and the HTTP
+196 tests, no network and no API key required. They cover Black-Scholes against
+textbook values and a real broker quote, indicator maths, structure arithmetic
+checked by hand, expected-value calibration, margin rules for every spread type,
+fill and settlement mechanics, no-lookahead guarantees in the backtester,
+extended-hours parsing for both vendors, the NYSE session calendar, and the HTTP
 API end to end.
+
+Tests drive a deterministic simulator that lives in `tests/simulated_provider.py`.
+It is deliberately outside the application package: it is injected directly by
+the fixtures and cannot be reached through any configuration, so fabricated
+prices cannot leak into the running app. A test asserts that every simulated
+provider name is rejected by `build_provider`.
 
 ---
 
@@ -351,7 +398,7 @@ All optional; see `.env.example`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MARKET_DATA_PROVIDER` | `auto` | `auto`, `tradier`, `yahoo`, `demo` |
+| `MARKET_DATA_PROVIDER` | `auto` | `auto`, `tradier`, `yahoo` (no simulated option) |
 | `TRADIER_TOKEN` | — | enables real-time data |
 | `TRADIER_BASE_URL` | `https://api.tradier.com/v1` | sandbox URL for a sandbox token |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | server binding |
@@ -375,6 +422,12 @@ change `HOST` to expose it on a network, put it behind something that does.
 - **Free option data is delayed.** Yahoo chains lag roughly 15 minutes, which is
   a long time for a 0DTE contract. Use Tradier with a brokerage token if you
   intend to act on the output.
+- **Extended-hours liquidity is thin.** Pre- and post-market prices are real
+  trades, but they print on far less volume with much wider spreads, so an
+  after-hours quote is a weaker signal than a regular-session one.
+- **Stale data is still stale.** When a provider is down the app shows the last
+  real prices it had and labels them. A three-hour-old quote is a fact about
+  three hours ago, not a current market.
 - **Backtested option P&L is modelled, not replayed.** See above.
 - **News sentiment is a keyword lexicon**, not a language model. It catches
   obvious tone and misses sarcasm, nuance and anything phrased unusually.

@@ -6,7 +6,7 @@ import pytest
 
 from backend.providers.base import (Bars, NewsItem, OptionChain, OptionContract,
                                     Quote, occ_symbol, parse_occ)
-from backend.providers.demo import DemoProvider
+from tests.simulated_provider import SimulatedProvider
 from backend.providers.registry import MarketData, TTLCache
 
 
@@ -65,14 +65,14 @@ def test_contract_without_a_market_reports_no_spread():
 
 # ---------------- demo provider ----------------
 def test_demo_provider_is_deterministic():
-    a = DemoProvider(as_of=date(2026, 8, 31))
-    b = DemoProvider(as_of=date(2026, 8, 31))
+    a = SimulatedProvider(as_of=date(2026, 8, 31))
+    b = SimulatedProvider(as_of=date(2026, 8, 31))
     assert run(a.quotes(["SPY"]))["SPY"].last == run(b.quotes(["SPY"]))["SPY"].last
     assert run(a.history("NVDA", 60)).closes == run(b.history("NVDA", 60)).closes
 
 
 def test_demo_history_ends_on_the_as_of_date():
-    p = DemoProvider(as_of=date(2026, 8, 31))
+    p = SimulatedProvider(as_of=date(2026, 8, 31))
     bars = run(p.history("SPY", 120))
     assert bars.bars[-1].date == "2026-08-31"
     assert len(bars) == 121
@@ -81,12 +81,12 @@ def test_demo_history_ends_on_the_as_of_date():
 
 
 def test_demo_history_skips_weekends():
-    bars = run(DemoProvider(as_of=date(2026, 8, 31)).history("SPY", 60))
+    bars = run(SimulatedProvider(as_of=date(2026, 8, 31)).history("SPY", 60))
     assert all(date.fromisoformat(b.date).weekday() < 5 for b in bars.bars)
 
 
 def test_demo_chain_is_priced_and_two_sided():
-    p = DemoProvider(as_of=date(2026, 8, 31))
+    p = SimulatedProvider(as_of=date(2026, 8, 31))
     exps = run(p.expirations("SPY"))
     chain = run(p.chain("SPY", exps[3]))
     assert chain.calls and chain.puts
@@ -100,14 +100,14 @@ def test_demo_chain_is_priced_and_two_sided():
 
 
 def test_demo_chain_rejects_an_unlisted_expiration():
-    p = DemoProvider(as_of=date(2026, 8, 31))
+    p = SimulatedProvider(as_of=date(2026, 8, 31))
     assert run(p.chain("SPY", "1999-01-01")) is None
     assert run(p.chain("SPY", "not-a-date")) is None
 
 
 def test_demo_smile_bids_up_downside_puts():
     """Equity index skew: out-of-the-money puts carry higher IV than OTM calls."""
-    p = DemoProvider(as_of=date(2026, 8, 31))
+    p = SimulatedProvider(as_of=date(2026, 8, 31))
     chain = run(p.chain("SPY", run(p.expirations("SPY"))[5]))
     spot = chain.underlying_price
     otm_put = min((c for c in chain.puts if c.strike < spot * 0.97),
@@ -184,7 +184,7 @@ def test_cache_invalidation_by_prefix():
     assert run(scenario()) == 1
 
 
-# ---------------- fallback ----------------
+# ---------------- last-known-good fallback ----------------
 class BrokenProvider:
     """Stands in for a vendor that is down or rate limiting."""
     name = "broken"
@@ -209,28 +209,6 @@ class BrokenProvider:
         return None
 
 
-def test_failed_provider_falls_back_and_flags_degraded():
-    md = MarketData(BrokenProvider(), fallback=True)
-    quotes = run(md.quotes(["SPY"]))
-    assert "SPY" in quotes
-    assert md.degraded, "serving simulated data must be flagged, never silent"
-    assert len(run(md.history("SPY", 120))) > 0
-    assert run(md.chain("SPY", run(md.expirations("SPY"))[2])) is not None
-
-
-def test_fallback_can_be_disabled():
-    md = MarketData(BrokenProvider(), fallback=False)
-    assert run(md.quotes(["SPY"])) == {}
-    assert not md.degraded
-
-
-def test_healthy_provider_is_not_marked_degraded():
-    md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
-    run(md.quotes(["SPY"]))
-    assert not md.degraded
-
-
-# ---------------- circuit breaker ----------------
 class CountingBrokenProvider(BrokenProvider):
     """Counts how many times a dead vendor actually gets called."""
 
@@ -246,10 +224,82 @@ class CountingBrokenProvider(BrokenProvider):
         return Bars(symbol.upper(), [])
 
 
-def test_circuit_breaker_stops_calling_a_dead_provider():
+def test_a_dead_provider_never_invents_a_price(fresh_db):
+    """The core guarantee: no data means no number, not a made-up one."""
+    md = MarketData(BrokenProvider(), use_store=True)
+    quotes = run(md.quotes(["SPY"]))
+    assert quotes == {}, "a price was produced with no data source"
+    assert "SPY" in md.missing_symbols
+
+
+def test_store_serves_the_last_real_price_when_the_vendor_dies(fresh_db):
+    live = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    real = run(live.quotes(["SPY"]))["SPY"]
+
+    dead = MarketData(BrokenProvider(), use_store=True)
+    recovered = run(dead.quotes(["SPY"]))["SPY"]
+
+    assert recovered.last == real.last, "the cached price should be the one really fetched"
+    assert recovered.stale is True
+    assert recovered.as_of, "stale data must carry the time it was captured"
+    assert "SPY" in dead.stale_symbols
+
+
+def test_stale_data_is_reported_not_hidden(fresh_db):
+    live = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    run(live.quotes(["SPY", "QQQ"]))
+
+    dead = MarketData(BrokenProvider(), use_store=True)
+    run(dead.quotes(["SPY", "QQQ"]))
+    status = dead.data_status()
+    assert status["stale_count"] == 2
+    assert set(status["stale_symbols"]) == {"SPY", "QQQ"}
+    assert status["stale_age"]
+    assert dead.serving_stale
+
+
+def test_a_fresh_fetch_clears_the_stale_flag(fresh_db):
+    md = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    run(md.quotes(["SPY"]))
+    assert not md.serving_stale
+    assert md.data_status()["stale_count"] == 0
+
+
+def test_history_and_chains_also_fall_back_to_real_cached_data(fresh_db):
+    live = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    bars = run(live.history("SPY", 120))
+    exps = run(live.expirations("SPY"))
+    chain = run(live.chain("SPY", exps[2]))
+    assert len(bars) and exps and chain
+
+    dead = MarketData(BrokenProvider(), use_store=True)
+    assert len(run(dead.history("SPY", 120))) == len(bars)
+    assert run(dead.chain("SPY", exps[2])) is not None
+    assert "SPY" in dead.stale_symbols
+
+
+def test_cached_expirations_drop_dates_that_have_passed(fresh_db):
+    """A remembered expiry list must never offer a date already in the past."""
+    from backend.providers import store
+    past, future = "2020-01-17", "2099-01-15"
+    store.put("exp:ZZZ", "expirations", [past, future], "ZZZ")
+
+    dead = MarketData(BrokenProvider(), use_store=True)
+    assert run(dead.expirations("ZZZ")) == [future]
+
+
+def test_store_can_be_disabled(fresh_db):
+    live = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    run(live.quotes(["SPY"]))
+    dead = MarketData(BrokenProvider(), use_store=False)
+    assert run(dead.quotes(["SPY"])) == {}
+
+
+# ---------------- circuit breaker ----------------
+def test_circuit_breaker_stops_calling_a_dead_provider(fresh_db):
     """Without this, a 60-symbol scan waits out 60 separate timeouts."""
     broken = CountingBrokenProvider()
-    md = MarketData(broken, fallback=True)
+    md = MarketData(broken, use_store=False)
     md.FAILURE_THRESHOLD = 3
 
     async def scenario():
@@ -259,11 +309,10 @@ def test_circuit_breaker_stops_calling_a_dead_provider():
     run(scenario())
     assert md.circuit_open
     assert broken.calls == 3, f"provider was called {broken.calls} times after failing"
-    assert md.degraded
 
 
-def test_circuit_breaker_stays_closed_for_a_healthy_provider():
-    md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
+def test_circuit_breaker_stays_closed_for_a_healthy_provider(fresh_db):
+    md = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=False)
 
     async def scenario():
         for sym in ("SPY", "QQQ", "AAPL", "NVDA", "TSLA"):
@@ -271,42 +320,116 @@ def test_circuit_breaker_stays_closed_for_a_healthy_provider():
 
     run(scenario())
     assert not md.circuit_open
-    assert not md.degraded
+    assert not md.serving_stale
 
 
-def test_a_success_resets_the_failure_count():
-    md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
+def test_a_success_resets_the_failure_count(fresh_db):
+    md = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=False)
     md._consecutive_failures = 2
     run(md.quotes(["SPY"]))
     assert md._consecutive_failures == 0
 
 
-def test_circuit_breaker_still_serves_usable_data():
+def test_breaker_still_serves_cached_data_while_open(fresh_db):
     """Tripping the breaker must degrade the app, never break it."""
-    md = MarketData(CountingBrokenProvider(), fallback=True)
+    live = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=True)
+    run(live.quotes(["SPY"]))
+    run(live.history("SPY", 120))
+
+    md = MarketData(CountingBrokenProvider(), use_store=True)
     md.FAILURE_THRESHOLD = 2
 
     async def scenario():
         for i in range(6):
             await md.quotes([f"S{i}"])
-        return (await md.quotes(["SPY"]), await md.history("SPY", 120),
-                await md.expirations("SPY"))
+        return await md.quotes(["SPY"]), await md.history("SPY", 120)
 
-    quotes, bars, exps = run(scenario())
-    assert "SPY" in quotes and quotes["SPY"].last > 0
+    quotes, bars = run(scenario())
+    assert quotes["SPY"].last > 0 and quotes["SPY"].stale
     assert len(bars) > 60
-    assert exps
 
 
-def test_breaker_is_disabled_without_a_fallback():
-    """With no fallback there is nothing to fail over to, so keep trying."""
-    broken = CountingBrokenProvider()
-    md = MarketData(broken, fallback=False)
-    md.FAILURE_THRESHOLD = 2
+# ---------------- provider selection ----------------
+def test_simulated_providers_cannot_be_configured():
+    """No setting may put fabricated prices in front of a user."""
+    from backend.providers.registry import ProviderUnavailable, build_provider
+    for name in ("demo", "simulated", "fake", "offline"):
+        with pytest.raises(ProviderUnavailable, match="Simulated"):
+            build_provider(name)
 
-    async def scenario():
-        for i in range(5):
-            await md.quotes([f"S{i}"])
 
-    run(scenario())
-    assert broken.calls == 5
+def test_unknown_provider_is_rejected_with_the_valid_options():
+    from backend.providers.registry import ProviderUnavailable, build_provider
+    with pytest.raises(ProviderUnavailable, match="yahoo"):
+        build_provider("nonsense")
+
+
+def test_tradier_without_a_token_is_an_explicit_error():
+    from backend import config
+    from backend.providers.registry import ProviderUnavailable, build_provider
+    original = config.settings.tradier_token
+    config.settings.tradier_token = ""
+    try:
+        with pytest.raises(ProviderUnavailable, match="TRADIER_TOKEN"):
+            build_provider("tradier")
+    finally:
+        config.settings.tradier_token = original
+
+
+def test_yahoo_is_the_default_without_a_token():
+    from backend import config
+    from backend.providers.registry import build_provider
+    original = config.settings.tradier_token
+    config.settings.tradier_token = ""
+    try:
+        assert build_provider("auto").name == "yahoo"
+    finally:
+        config.settings.tradier_token = original
+
+
+# ---------------- expirations come only from the vendor ----------------
+def test_expirations_are_never_synthesised(fresh_db):
+    """Regression guard for an invented expiry date.
+
+    A simulated feed generated every weekday as an expiration, which produced a
+    Tuesday 1 September expiry for AAPL - a date that does not exist on the
+    real chain (AAPL lists Aug 31, Sep 2, Sep 4, Sep 9, Sep 11...). Expirations
+    must only ever come from the vendor's own list.
+    """
+    real_dates = ["2026-08-31", "2026-09-02", "2026-09-04", "2026-09-09", "2026-09-11"]
+
+    class VendorProvider(BrokenProvider):
+        name = "vendor"
+
+        async def expirations(self, symbol):
+            return list(real_dates)
+
+        async def chain(self, symbol, expiration):
+            if expiration not in real_dates:
+                raise AssertionError(f"asked for an unlisted expiration: {expiration}")
+            return None
+
+    md = MarketData(VendorProvider(), use_store=True)
+    assert run(md.expirations("AAPL")) == real_dates
+    assert "2026-09-01" not in run(md.expirations("AAPL"))
+
+
+def test_scanner_only_uses_expirations_the_vendor_lists(fresh_db):
+    """End to end: no idea may carry an expiry outside the vendor's list."""
+    import asyncio as _asyncio
+    from backend.engine.scanner import Scanner
+
+    provider = SimulatedProvider(as_of=date(2026, 8, 31))
+    md = MarketData(provider, use_store=False)
+    result = run(Scanner(md).scan("core", 0, 3, 0, limit=30, include_news=False))
+
+    async def listed(symbol):
+        return set(await provider.expirations(symbol))
+
+    for idea in result.ideas:
+        allowed = run(listed(idea["symbol"]))
+        assert idea["expiration"] in allowed, (
+            f"{idea['symbol']} idea uses {idea['expiration']}, which the provider "
+            f"does not list")
+        for leg in idea["legs"]:
+            assert leg["expiration"] in allowed

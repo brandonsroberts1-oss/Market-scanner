@@ -227,13 +227,52 @@ def _tradier_handler(request):
     return httpx.Response(404)
 
 
-def test_tradier_parses_a_single_quote_object():
+def test_tradier_parses_a_single_quote_object(monkeypatch):
     """Tradier returns a bare object rather than a list for one symbol."""
+    from backend import market_hours
+    monkeypatch.setattr(market_hours, "session", lambda *a, **k: market_hours.REGULAR)
     q = run(_tradier_provider(_tradier_handler).quotes(["SPY"]))["SPY"]
     assert q.last == pytest.approx(765.89)
     assert q.bid == pytest.approx(765.88)
     assert q.previous_close == pytest.approx(769.35)
     assert q.name == "SPDR S&P 500"
+    assert q.extended_last is None, "no extended print during the regular session"
+
+
+def test_tradier_splits_regular_and_after_hours_prices(monkeypatch):
+    """Tradier reports one `last` that silently includes extended-hours prints.
+
+    Uses the real numbers from a live AAPL feed: the regular session closed at
+    317.15 and an after-hours trade printed at 317.05.
+    """
+    from backend import market_hours
+    payload = {"quotes": {"quote": {
+        "symbol": "AAPL", "description": "Apple", "last": 317.05, "close": 317.15,
+        "prevclose": 319.70, "bid": 317.05, "ask": 317.15,
+    }}}
+    provider = _tradier_provider(lambda r: httpx.Response(200, json=payload))
+
+    monkeypatch.setattr(market_hours, "session", lambda *a, **k: market_hours.AFTER)
+    q = run(provider.quotes(["AAPL"]))["AAPL"]
+    assert q.last == pytest.approx(317.15), "regular close must not be overwritten"
+    assert q.extended_last == pytest.approx(317.05)
+    assert q.extended_change_pct == pytest.approx(-0.0315, abs=0.001)
+    assert q.price == pytest.approx(317.05), "marking uses the most recent trade"
+    assert q.change_pct == pytest.approx(-0.797, abs=0.01), "day change is off the close"
+    assert q.market_session == market_hours.AFTER
+
+
+def test_tradier_treats_a_pre_market_trade_as_extended(monkeypatch):
+    from backend import market_hours
+    payload = {"quotes": {"quote": {
+        "symbol": "AAPL", "last": 321.00, "close": None, "prevclose": 319.70,
+    }}}
+    provider = _tradier_provider(lambda r: httpx.Response(200, json=payload))
+    monkeypatch.setattr(market_hours, "session", lambda *a, **k: market_hours.PRE)
+    q = run(provider.quotes(["AAPL"]))["AAPL"]
+    assert q.last == pytest.approx(319.70), "pre-market reference is yesterday's close"
+    assert q.extended_last == pytest.approx(321.00)
+    assert q.extended_change_pct > 0
 
 
 def test_tradier_expirations_handle_both_shapes():
@@ -249,6 +288,14 @@ def test_tradier_history_parses():
     bars = run(_tradier_provider(_tradier_handler).history("SPY", 30))
     assert len(bars) == 2
     assert bars.bars[-1].close == pytest.approx(769.35)
+
+
+def test_tradier_rejects_an_unlisted_expiration():
+    """Asking a vendor for a date it does not list must return nothing rather
+    than a chain silently labelled with the wrong expiry."""
+    provider = _tradier_provider(_tradier_handler)
+    assert run(provider.chain("SPY", "2026-09-01")) is None   # not in the listed set
+    assert run(provider.chain("SPY", "2026-09-02")) is not None
 
 
 def test_tradier_converts_greeks_to_the_apps_units():
@@ -269,6 +316,66 @@ def test_tradier_sandbox_is_flagged_as_delayed():
     sandbox = TradierProvider("t", "https://sandbox.tradier.com/v1")
     assert live.realtime is True
     assert sandbox.realtime is False
+
+
+def test_yahoo_rejects_an_unlisted_expiration(yahoo):
+    """Yahoo returns the nearest expiry for a bad date, which would mislabel
+    the entire chain, so the date is validated against the listed set first."""
+    assert run(yahoo.chain("SPY", "2026-09-01")) is None
+    assert run(yahoo.chain("SPY", "2026-09-02")) is not None
+
+
+def test_yahoo_reads_post_market_price(monkeypatch):
+    """The v7 quote endpoint is the only Yahoo path with explicit pre/post."""
+    payload = {"quoteResponse": {"result": [{
+        "symbol": "AAPL", "marketState": "POST", "regularMarketPrice": 317.15,
+        "regularMarketPreviousClose": 319.70, "postMarketPrice": 317.05,
+        "postMarketTime": 1788205652, "shortName": "Apple Inc.",
+    }]}}
+
+    def handler(request):
+        url = str(request.url)
+        if "getcrumb" in url:
+            return httpx.Response(200, text="c")
+        if "fc.yahoo.com" in url:
+            return httpx.Response(200, text="ok")
+        if "/v7/finance/quote" in url:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    p = YahooProvider()
+    p._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    q = run(p.quotes(["AAPL"]))["AAPL"]
+    assert q.last == pytest.approx(317.15)
+    assert q.extended_last == pytest.approx(317.05)
+    assert q.market_session == "after-hours"
+    assert q.extended_timestamp is not None
+
+
+def test_yahoo_pre_market_price_is_kept_separate():
+    payload = {"quoteResponse": {"result": [{
+        "symbol": "NVDA", "marketState": "PRE", "regularMarketPrice": 220.88,
+        "regularMarketPreviousClose": 217.55, "preMarketPrice": 223.10,
+        "preMarketTime": 1788205652,
+    }]}}
+
+    def handler(request):
+        url = str(request.url)
+        if "getcrumb" in url:
+            return httpx.Response(200, text="c")
+        if "fc.yahoo.com" in url:
+            return httpx.Response(200, text="ok")
+        if "/v7/finance/quote" in url:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404)
+
+    p = YahooProvider()
+    p._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    q = run(p.quotes(["NVDA"]))["NVDA"]
+    assert q.last == pytest.approx(220.88)
+    assert q.extended_last == pytest.approx(223.10)
+    assert q.market_session == "pre-market"
+    assert q.price == pytest.approx(223.10)
 
 
 def test_tradier_survives_an_auth_failure():

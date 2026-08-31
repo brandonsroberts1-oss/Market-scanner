@@ -9,22 +9,23 @@ import pytest
 
 _TMP = tempfile.mkdtemp(prefix="market-scanner-tests-")
 os.environ["DB_PATH"] = str(Path(_TMP) / "test.db")
-os.environ["MARKET_DATA_PROVIDER"] = "demo"
 
-from backend.providers.demo import DemoProvider          # noqa: E402
 from backend.providers.registry import MarketData        # noqa: E402
+from tests.simulated_provider import SimulatedProvider   # noqa: E402
 
 AS_OF = date(2026, 8, 31)
 
 
 @pytest.fixture
 def provider():
-    return DemoProvider(as_of=AS_OF)
+    """The simulator is a TEST FIXTURE only - it is not reachable from the app."""
+    return SimulatedProvider(as_of=AS_OF)
 
 
 @pytest.fixture
 def market(provider):
-    return MarketData(provider, fallback=False)
+    # use_store=False keeps each test isolated from the last-known-good cache.
+    return MarketData(provider, use_store=False)
 
 
 @pytest.fixture

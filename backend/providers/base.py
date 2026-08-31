@@ -12,6 +12,14 @@ from typing import Protocol
 
 @dataclass
 class Quote:
+    """A price for one symbol.
+
+    `last` is always the REGULAR-session price - the last trade during normal
+    hours, or the official close once the session has ended. Pre- and
+    post-market trades live in `extended_last` with their own timestamp, so a
+    4:30pm print is never silently presented as the closing price.
+    """
+
     symbol: str
     last: float
     bid: float | None = None
@@ -24,6 +32,17 @@ class Quote:
     timestamp: str | None = None
     name: str | None = None
     delayed: bool = False
+
+    # Extended hours
+    extended_last: float | None = None
+    extended_timestamp: str | None = None
+    market_session: str | None = None      # pre-market | regular | after-hours | closed
+
+    # Provenance - set when this came from the last-known-good store rather
+    # than a live fetch, so the UI can say how old it is.
+    stale: bool = False
+    as_of: str | None = None
+    source: str | None = None
 
     @property
     def change(self) -> float | None:
@@ -38,16 +57,45 @@ class Quote:
         return (self.last / self.previous_close - 1.0) * 100.0
 
     @property
+    def extended_change(self) -> float | None:
+        """Extended-hours move, measured from the regular close - the way a
+        broker quotes it."""
+        if self.extended_last is None or not self.last:
+            return None
+        return self.extended_last - self.last
+
+    @property
+    def extended_change_pct(self) -> float | None:
+        if self.extended_last is None or not self.last:
+            return None
+        return (self.extended_last / self.last - 1.0) * 100.0
+
+    @property
+    def price(self) -> float:
+        """The most recent traded price, whichever session produced it.
+
+        Use this for marking positions and for anything that means "what is it
+        worth right now". Use `last` when you specifically mean the regular
+        session.
+        """
+        if self.extended_last is not None and self.extended_last > 0:
+            return self.extended_last
+        return self.last
+
+    @property
     def mid(self) -> float:
-        """Bid/ask midpoint, falling back to last when the book is empty."""
+        """Bid/ask midpoint, falling back to the latest trade."""
         if self.bid and self.ask and self.ask >= self.bid > 0:
             return (self.bid + self.ask) / 2.0
-        return self.last
+        return self.price
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["change"] = self.change
         d["change_pct"] = self.change_pct
+        d["extended_change"] = self.extended_change
+        d["extended_change_pct"] = self.extended_change_pct
+        d["price"] = self.price
         return d
 
 

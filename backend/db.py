@@ -99,6 +99,19 @@ CREATE TABLE IF NOT EXISTS backtests (
     result       TEXT NOT NULL
 );
 
+-- Last-known-good market data. Only ever written from a successful live
+-- fetch, so what is served from here is real data that has aged, never
+-- anything invented.
+CREATE TABLE IF NOT EXISTS market_cache (
+    key        TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    symbol     TEXT,
+    payload    TEXT NOT NULL,
+    source     TEXT,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_kind    ON market_cache(kind, symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_session  ON orders(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_sess  ON positions(session_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_sess  ON snapshots(session_id, taken_at);

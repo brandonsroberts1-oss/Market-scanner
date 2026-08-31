@@ -19,8 +19,10 @@ from .engine import catalysts as cat
 from .engine.scanner import Scanner
 from .engine.strategies import payoff_curve, Leg
 from .engine.universe import PRESETS, get_universe
+from . import market_hours
 from .paper import engine as paper
-from .providers.registry import MarketData, build_provider
+from .providers import store
+from .providers.registry import MarketData, ProviderUnavailable, build_provider
 
 # Per-symbol provider failures log at DEBUG: a vendor hiccup would otherwise
 # print one scary line per symbol, when the circuit breaker already prints a
@@ -38,10 +40,15 @@ state: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    state["market"] = MarketData(build_provider())
+    try:
+        state["market"] = MarketData(build_provider())
+    except ProviderUnavailable as exc:
+        log.error("Cannot start: %s", exc)
+        raise
     state["scanner"] = Scanner(state["market"])
-    log.info("Market Scanner ready - provider=%s realtime=%s",
-             state["market"].name, state["market"].realtime)
+    log.info("Market Scanner ready - provider=%s realtime=%s, %s",
+             state["market"].name, state["market"].realtime,
+             market_hours.session_label())
     try:
         yield
     finally:
@@ -70,8 +77,10 @@ async def status():
     return {
         "provider": md.name,
         "realtime": md.realtime,
-        "degraded": md.degraded,
         "server_time": datetime.now(timezone.utc).isoformat(),
+        "market": market_hours.describe(),
+        "data": md.data_status(),
+        "cache": store.stats(),
         "presets": list(PRESETS.keys()),
         "default_cash": settings.default_cash,
         "option_commission": settings.option_commission,
@@ -80,17 +89,19 @@ async def status():
 
 
 def _data_note(md: MarketData) -> str:
-    if md.degraded and md.name != "demo":
-        return (f"The {md.name} provider is not responding, so some or all data is coming "
-                "from the offline simulator. Those prices are generated, not real - do not "
-                "trade off them. Check your network or API token.")
-    if md.name == "demo":
-        return ("Running on the offline simulator. Prices are generated, not real. "
-                "Set TRADIER_TOKEN or switch MARKET_DATA_PROVIDER to yahoo for live data.")
+    """One sentence on how much to trust what is on screen."""
+    stale = md.data_status()
+    if stale["stale_count"]:
+        return (f"The {md.name} provider is not responding for "
+                f"{stale['stale_count']} symbol(s), so the app is showing the most "
+                f"recent real prices it already had (last updated "
+                f"{stale['stale_age']}). Those rows are marked stale. Nothing here "
+                f"is simulated.")
     if md.name == "yahoo":
-        return ("Yahoo Finance: equity quotes are near-real-time; option chains are "
-                "typically delayed about 15 minutes. Implied vol is re-solved from the "
-                "live midpoint rather than taken from the vendor's stale field.")
+        return ("Yahoo Finance: equity quotes are near-real-time and include pre- and "
+                "post-market prices; option chains are typically delayed about 15 "
+                "minutes. Implied vol is re-solved from the live midpoint rather than "
+                "taken from the vendor's stale field.")
     if md.name == "tradier" and not md.realtime:
         return "Tradier sandbox: quotes are delayed. A brokerage token returns real-time data."
     return "Tradier real-time: live NBBO quotes with exchange-published greeks."
@@ -222,6 +233,8 @@ async def market_brief():
         "catalysts": [c.to_dict() for c in catalyst_list],
         "narrative": cat.market_narrative(headlines, catalyst_list, breadth),
         "breadth": breadth,
+        "market": market_hours.describe(),
+        "data": md.data_status(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 

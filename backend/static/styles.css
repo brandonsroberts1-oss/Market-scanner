@@ -155,6 +155,7 @@ tr.detail-row > td { background: var(--bg); padding: 0; border-bottom: 2px solid
 .badge.short   { background: #3a1618; color: var(--down-bright); }
 .badge.avoid   { background: #22283a; color: var(--text-faint); }
 .badge.active  { background: #123626; color: var(--up-bright); }
+.badge.stale   { background: #3a2a12; color: var(--warn); }
 .badge.closed  { background: #22283a; color: var(--text-faint); }
 
 /* ---------- conviction meter ---------- */
@@ -174,6 +175,14 @@ tr.detail-row > td { background: var(--bg); padding: 0; border-bottom: 2px solid
 .tile .sym { font-size: 11px; color: var(--text-dim); font-weight: 600; letter-spacing: 0.5px; }
 .tile .px { font-size: 21px; font-weight: 600; font-family: var(--mono); margin: 3px 0; }
 .tile .chg { font-size: 12px; font-family: var(--mono); }
+.tile .ext {
+  margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--border);
+  display: flex; align-items: baseline; gap: 7px; font-size: 11px;
+}
+.tile .ext-label {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-faint); font-weight: 600;
+}
 
 .stat { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius); padding: 11px 13px; }
 .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); }

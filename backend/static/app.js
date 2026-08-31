@@ -84,6 +84,20 @@ function esc(s) {
 
 function cls(v) { return v > 0 ? 'up' : v < 0 ? 'down' : 'dim'; }
 
+/** The pre/post-market line under a price, the way a broker shows it: the
+ *  regular price stays put and the extended print sits beneath it. */
+function extendedLine(q) {
+  if (q.extended_last === null || q.extended_last === undefined) return '';
+  const label = q.market_session === 'pre-market' ? 'Pre-market'
+    : q.market_session === 'after-hours' ? 'After hours'
+    : 'Extended';
+  return `<div class="ext">
+    <span class="ext-label">${label}</span>
+    <span class="mono">${fmt.num(q.extended_last)}</span>
+    <span class="mono ${cls(q.extended_change_pct)}">${fmt.pct(q.extended_change_pct)}</span>
+  </div>`;
+}
+
 function toast(message, kind = '') {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
@@ -122,17 +136,21 @@ async function loadStatus() {
   try {
     const s = await api('/api/status');
     state.status = s;
+    const stale = (s.data && s.data.stale_count) || 0;
     const dot = $('#statusChip .dot');
-    dot.className = 'dot' + (s.provider === 'demo' || s.degraded ? ' sim' : s.realtime ? '' : ' delayed');
-    const quality = s.provider === 'demo' ? 'SIMULATED DATA'
-      : s.degraded ? 'SIMULATED FALLBACK'
-      : s.realtime ? 'real-time' : 'delayed';
-    $('#statusText').textContent = `${s.provider} · ${quality}`;
+    dot.className = 'dot' + (stale ? ' sim' : s.realtime ? '' : ' delayed');
+
+    const quality = stale ? `${stale} stale` : s.realtime ? 'real-time' : 'delayed';
+    const session = (s.market && s.market.label) || '';
+    $('#statusText').textContent = `${s.provider} · ${quality}${session ? ' · ' + session : ''}`;
     $('#statusChip').title = s.data_note;
-    if (s.provider === 'demo' || s.degraded) {
-      const note = $('#scanNote');
+
+    const note = $('#scanNote');
+    if (stale) {
       note.hidden = false;
       note.textContent = s.data_note;
+    } else {
+      note.hidden = true;
     }
   } catch (err) {
     $('#statusText').textContent = 'offline';
@@ -144,14 +162,35 @@ async function loadStatus() {
 async function loadDashboard() {
   try {
     const brief = await api('/api/market/brief');
-    $('#briefTime').textContent = fmt.ago(brief.generated_at);
+    $('#briefTime').textContent = fmt.ago(brief.generated_at)
+      + (brief.market ? ` · ${brief.market.label}` : '');
+
+    // Say plainly why anything is marked stale, on the landing screen.
+    const ds = brief.data || {};
+    const notice = $('#dataNotice');
+    if (ds.stale_count || (ds.missing_symbols || []).length) {
+      notice.hidden = false;
+      const parts = [];
+      if (ds.stale_count) {
+        parts.push(`${ds.stale_count} symbol(s) could not be refreshed from `
+          + `${ds.provider}. Showing the most recent real prices already fetched `
+          + `(${ds.stale_age}), marked STALE. Nothing here is simulated.`);
+      }
+      if ((ds.missing_symbols || []).length) {
+        parts.push(`No data at all yet for ${ds.missing_symbols.join(', ')}.`);
+      }
+      notice.textContent = parts.join(' ');
+    } else {
+      notice.hidden = true;
+    }
     $('#narrative').textContent = brief.narrative || 'No summary available.';
 
     $('#indexTiles').innerHTML = brief.indices.map((q) => `
       <div class="tile">
-        <div class="sym">${esc(q.symbol)}</div>
+        <div class="sym">${esc(q.symbol)}${q.stale ? ' <span class="badge stale">stale</span>' : ''}</div>
         <div class="px">${fmt.num(q.last)}</div>
         <div class="chg ${cls(q.change_pct)}">${fmt.pct(q.change_pct)} ${q.change !== null ? `(${fmt.signed(q.change)})` : ''}</div>
+        ${extendedLine(q)}
       </div>`).join('');
 
     $('#headlines').innerHTML = brief.headlines.length ? brief.headlines.map((h) => `
@@ -202,7 +241,7 @@ async function runScan(save = false) {
     renderScan(result);
     // A scan can be the first thing that discovers the provider is down, so
     // re-read status to keep the header chip truthful.
-    if (result.degraded && !state.status?.degraded) loadStatus();
+    if (result.data_status && result.data_status.stale_count) loadStatus();
     if (save) toast(`Scan saved (#${result.saved_scan_id})`, 'success');
   } catch (err) {
     $('#scanBody').innerHTML = `<tr><td colspan="14"><div class="empty">Scan failed: ${esc(err.message)}</div></td></tr>`;
@@ -214,12 +253,23 @@ $('#saveScan').addEventListener('click', () => runScan(true));
 
 function renderScan(r) {
   $('#scanMeta').textContent =
-    `${r.ideas.length} ideas · ${r.universe.length} symbols · ${r.min_dte}-${r.max_dte} DTE · ${r.elapsed_seconds}s · ${fmt.ago(r.generated_at)}`;
+    `${r.ideas.length} ideas · ${r.universe.length} symbols · ${r.min_dte}-${r.max_dte} DTE`
+    + ` · ${r.elapsed_seconds}s · ${fmt.ago(r.generated_at)}`
+    + (r.market_session ? ` · ${r.market_session}` : '');
 
-  if (r.degraded) {
-    const note = $('#scanNote');
+  const ds = r.data_status || {};
+  const note = $('#scanNote');
+  if (ds.stale_count) {
     note.hidden = false;
-    note.textContent = 'Some symbols fell back to simulated data because the live provider did not return them. Rows built on simulated prices are not tradeable signals.';
+    note.textContent = `${ds.stale_count} symbol(s) could not be refreshed from ${r.provider}, `
+      + `so their rows use the most recent real prices already fetched (${ds.stale_age}). `
+      + `Those rows are marked STALE. Nothing shown is simulated.`;
+  } else {
+    note.hidden = true;
+  }
+  if ((ds.missing_symbols || []).length) {
+    note.hidden = false;
+    note.textContent += ` No data at all for: ${ds.missing_symbols.join(', ')}.`;
   }
 
   if (!r.ideas.length) {
@@ -229,7 +279,7 @@ function renderScan(r) {
 
   $('#scanBody').innerHTML = r.ideas.map((idea, i) => `
     <tr class="clickable" data-idx="${i}">
-      <td><strong>${esc(idea.symbol)}</strong><div class="tiny faint mono">${fmt.num(idea.underlying_price)}</div></td>
+      <td><strong>${esc(idea.symbol)}</strong>${idea.stale ? ' <span class="badge stale" title="Provider unreachable; using the last real price fetched">stale</span>' : ''}<div class="tiny faint mono">${fmt.num(idea.underlying_price)}</div></td>
       <td>${esc(idea.label)}<div class="tiny faint">${esc(idea.expiration)}</div></td>
       <td><span class="badge ${idea.direction}">${idea.direction}</span></td>
       <td>${convictionCell(idea.conviction)}</td>

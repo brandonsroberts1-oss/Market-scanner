@@ -1,13 +1,11 @@
-"""Deterministic offline market simulator.
+"""Deterministic market simulator - FOR TESTS ONLY.
 
-This provider needs no network and no API key.  It generates a reproducible
-price history per symbol (seeded from the symbol name), then prices a full
-option chain off that history with Black-Scholes plus a realistic volatility
-smile, bid/ask spreads and open-interest profile.
+This lives under tests/ deliberately. It is not importable as an application
+provider and cannot be selected at runtime by any configuration, because the
+app must never show a price that did not actually trade.
 
-It exists for three reasons: the app stays usable when a data vendor is down,
-the test suite is deterministic, and you can explore the whole UI without
-signing up for anything.  Prices are SIMULATED - never trade off them.
+Its only job is to make the test suite deterministic and runnable without a
+network or an API key. The prices it generates are fabricated.
 """
 from __future__ import annotations
 
@@ -16,8 +14,8 @@ import math
 import random
 from datetime import date, datetime, timedelta, timezone
 
-from ..analytics import blackscholes as bs
-from .base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote, occ_symbol
+from backend.analytics import blackscholes as bs
+from backend.providers.base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote, occ_symbol
 
 # Rough starting price / annual vol / drift per well-known symbol so the demo
 # world resembles the real one.  Anything not listed gets deterministic values
@@ -46,10 +44,10 @@ def _profile(symbol: str) -> tuple[float, float, float]:
     return (rng.uniform(25.0, 400.0), rng.uniform(0.20, 0.55), rng.uniform(-0.05, 0.20))
 
 
-class DemoProvider:
-    """Simulated provider - deterministic given (symbol, as_of date)."""
+class SimulatedProvider:
+    """Deterministic given (symbol, as_of date). Test fixture only."""
 
-    name = "demo"
+    name = "simulated"
     realtime = False
 
     def __init__(self, as_of: date | None = None):

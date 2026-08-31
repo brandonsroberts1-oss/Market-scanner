@@ -39,7 +39,8 @@ class ScanResult:
     generated_at: str
     provider: str
     realtime: bool
-    degraded: bool
+    market_session: str
+    data_status: dict
     universe: list[str]
     min_dte: int
     max_dte: int
@@ -82,6 +83,8 @@ class Scanner:
         started = datetime.now(timezone.utc)
         symbols = get_universe(preset)
         today = started.date()
+        # Staleness is reported per scan, not accumulated across the session.
+        self.market.reset_status()
 
         # SPY history is needed by every symbol for beta and relative strength.
         spy_bars = await self.market.history("SPY", 180)
@@ -139,15 +142,20 @@ class Scanner:
                 d["warnings"] = r.assessment.warnings
                 d["factors"] = [f.to_dict() for f in r.assessment.factors]
                 d["news_sentiment"] = sentiment
+                d["stale"] = r.symbol.upper() in self.market.stale_symbols
+                d["as_of"] = self.market.stale_symbols.get(r.symbol.upper())
                 ideas.append(d)
         ideas.sort(key=lambda d: d["score"], reverse=True)
 
         equities = [r.equity.to_dict() for r in symbol_results if r.equity]
         equities.sort(key=lambda d: d["score"], reverse=True)
 
+        from .. import market_hours
         return ScanResult(
             generated_at=started.isoformat(), provider=self.market.name,
-            realtime=self.market.realtime, degraded=self.market.degraded,
+            realtime=self.market.realtime,
+            market_session=market_hours.session_label(),
+            data_status=self.market.data_status(),
             universe=symbols, min_dte=min_dte, max_dte=max_dte,
             ideas=ideas[:limit],
             equities=[e for e in equities if e["score"] > 0][:limit],
@@ -164,6 +172,10 @@ class Scanner:
                 self.market.history(symbol, 180), self.market.quotes([symbol])
             )
             quote = quotes.get(symbol.upper())
+            if quote is None:
+                empty = Signals(symbol=symbol.upper(), price=0.0)
+                return SymbolResult(symbol, empty, assess(empty),
+                                    error="no quote available from the data provider")
             if len(bars) < 25:
                 sig = build_signals(symbol, bars, quote)
                 return SymbolResult(symbol, sig, assess(sig), error="insufficient history")
@@ -203,6 +215,7 @@ class Scanner:
     async def _breadth(self, results: list[SymbolResult]) -> dict:
         """Advance/decline across the scanned names, plus index moves."""
         quotes = await self.market.quotes(BENCHMARKS)
+        from .. import market_hours
         advancers = sum(1 for r in results
                         if r.signals.change_pct is not None and r.signals.change_pct > 0)
         decliners = sum(1 for r in results
@@ -213,4 +226,5 @@ class Scanner:
             "decliners": decliners,
             "spy_change_pct": round(spy.change_pct, 2) if spy and spy.change_pct is not None else None,
             "indices": [q.to_dict() for q in quotes.values()],
+            "market_session": market_hours.session_label(),
         }

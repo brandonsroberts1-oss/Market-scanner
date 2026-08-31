@@ -233,13 +233,18 @@ def describe_provider(url: str) -> None:
     except Exception:
         return
     provider = status.get("provider", "unknown")
-    if provider == "demo":
-        warn("Running on SIMULATED data - prices are generated, not real.")
-        print("     To use live data, see 'Getting live data' in README.md.")
-    elif status.get("realtime"):
-        ok(f"Live real-time data via {provider}.")
+    session = (status.get("market") or {}).get("label", "")
+    stale = (status.get("data") or {}).get("stale_count", 0)
+
+    if status.get("realtime"):
+        ok(f"Real-time data via {provider}.")
     else:
         ok(f"Live data via {provider} (option chains may be delayed ~15 minutes).")
+    if session:
+        print(f"     Market is currently: {session}.")
+    if stale:
+        warn(f"{provider} did not answer for {stale} symbol(s); showing the most "
+             f"recent real prices already fetched, marked stale.")
 
 
 def open_browser_when_ready(url: str, process: subprocess.Popen) -> None:

@@ -4,13 +4,22 @@ from fastapi.testclient import TestClient
 
 from backend import db
 from backend.main import app
+from tests.conftest import AS_OF
+from tests.simulated_provider import SimulatedProvider
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    from backend import config
+    """Drive the real app, with the live vendor swapped for the test fixture.
+
+    The provider is injected rather than configured: the app deliberately
+    refuses to build a simulated provider from configuration, so there is no
+    setting that could make this happen in production.
+    """
+    from backend import config, main
     monkeypatch.setattr(config.settings, "db_path", str(tmp_path / "api.db"))
-    monkeypatch.setattr(config.settings, "provider_name", "demo")
+    monkeypatch.setattr(main, "build_provider",
+                        lambda *a, **k: SimulatedProvider(as_of=AS_OF))
     db._initialised = False
     db.init_db(force=True)
     with TestClient(app) as c:
@@ -18,13 +27,22 @@ def client(tmp_path, monkeypatch):
     db._initialised = False
 
 
-def test_status_reports_provider_and_data_quality(client):
+def test_status_reports_provider_data_quality_and_session(client):
     r = client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
-    assert body["provider"] == "demo"
     assert body["data_note"]
     assert "core" in body["presets"]
+    # The market session must be reported so a price can be labelled correctly.
+    assert body["market"]["session"] in ("pre-market", "regular",
+                                        "after-hours", "closed")
+    assert "stale_count" in body["data"]
+
+
+def test_status_never_advertises_a_simulated_provider(client):
+    body = client.get("/api/status").json()
+    note = body["data_note"].lower()
+    assert "simulat" not in note or "nothing here is simulated" in note
 
 
 def test_index_and_static_assets_are_served(client):

@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
+from .. import market_hours
 from ..analytics import blackscholes as bs
 from .base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote
 
@@ -70,23 +71,66 @@ class TradierProvider:
         if isinstance(rows, dict):
             rows = [rows]
 
+        session = market_hours.session()
         out: dict[str, Quote] = {}
         for row in rows:
-            last = _f(row.get("last")) or _f(row.get("close"))
-            if last is None:
-                continue
-            ts = row.get("trade_date")
-            out[row["symbol"].upper()] = Quote(
-                symbol=row["symbol"].upper(), last=last,
-                bid=_f(row.get("bid")), ask=_f(row.get("ask")),
-                previous_close=_f(row.get("prevclose")), open=_f(row.get("open")),
-                high=_f(row.get("high")), low=_f(row.get("low")),
-                volume=_f(row.get("volume")),
-                timestamp=(datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
-                           if isinstance(ts, (int, float)) and ts else None),
-                name=row.get("description"), delayed=not self.realtime,
-            )
+            quote = self._quote_from_row(row, session)
+            if quote:
+                out[quote.symbol] = quote
         return out
+
+    def _quote_from_row(self, row: dict, session: str) -> Quote | None:
+        """Split Tradier's single `last` into regular and extended prices.
+
+        Tradier reports one last-trade price that includes extended-hours
+        prints, with no field marking which session it came from. The split is
+        inferred from the clock plus the two reference prices the payload does
+        carry: `close` (today's regular close, populated only once the session
+        has ended) and `prevclose`.
+        """
+        symbol = row.get("symbol")
+        if not symbol:
+            return None
+        last = _f(row.get("last"))
+        regular_close = _f(row.get("close"))
+        prev_close = _f(row.get("prevclose"))
+        if last is None and regular_close is None:
+            return None
+
+        extended = None
+        if session == market_hours.REGULAR:
+            regular = last if last is not None else regular_close
+        elif session == market_hours.PRE:
+            # Before the open the regular reference is yesterday's close; any
+            # trade today is a pre-market print.
+            regular = prev_close if prev_close is not None else last
+            if last is not None and prev_close is not None and abs(last - prev_close) > 1e-9:
+                extended = last
+        else:
+            # After hours, or fully closed: `close` is today's official close
+            # once it exists, and anything since is an extended-hours trade.
+            regular = regular_close if regular_close is not None else last
+            if (last is not None and regular is not None
+                    and abs(last - regular) > 1e-9):
+                extended = last
+
+        if regular is None:
+            return None
+
+        ts = row.get("trade_date")
+        timestamp = (datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
+                     if isinstance(ts, (int, float)) and ts else None)
+        return Quote(
+            symbol=symbol.upper(), last=regular,
+            bid=_f(row.get("bid")), ask=_f(row.get("ask")),
+            previous_close=prev_close, open=_f(row.get("open")),
+            high=_f(row.get("high")), low=_f(row.get("low")),
+            volume=_f(row.get("volume")), timestamp=timestamp,
+            name=row.get("description"), delayed=not self.realtime,
+            extended_last=extended,
+            extended_timestamp=timestamp if extended is not None else None,
+            market_session=session,
+        )
 
     async def history(self, symbol: str, days: int = 180, interval: str = "1d") -> Bars:
         end = datetime.now(timezone.utc).date()
@@ -116,6 +160,13 @@ class TradierProvider:
         return [dates] if isinstance(dates, str) else list(dates)
 
     async def chain(self, symbol: str, expiration: str) -> OptionChain | None:
+        # Only ever quote an expiration the vendor lists, so a bad date returns
+        # nothing rather than a chain labelled with a date that does not exist.
+        listed = await self.expirations(symbol)
+        if listed and expiration not in listed:
+            log.debug("%s is not a listed expiration for %s", expiration, symbol)
+            return None
+
         chain_task = self._get("/markets/options/chains",
                                {"symbol": symbol, "expiration": expiration, "greeks": "true"})
         data, quotes = await asyncio.gather(chain_task, self.quotes([symbol]))
