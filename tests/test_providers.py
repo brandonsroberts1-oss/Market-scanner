@@ -228,3 +228,85 @@ def test_healthy_provider_is_not_marked_degraded():
     md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
     run(md.quotes(["SPY"]))
     assert not md.degraded
+
+
+# ---------------- circuit breaker ----------------
+class CountingBrokenProvider(BrokenProvider):
+    """Counts how many times a dead vendor actually gets called."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def quotes(self, symbols):
+        self.calls += 1
+        raise RuntimeError("upstream is down")
+
+    async def history(self, symbol, days=180, interval="1d"):
+        self.calls += 1
+        return Bars(symbol.upper(), [])
+
+
+def test_circuit_breaker_stops_calling_a_dead_provider():
+    """Without this, a 60-symbol scan waits out 60 separate timeouts."""
+    broken = CountingBrokenProvider()
+    md = MarketData(broken, fallback=True)
+    md.FAILURE_THRESHOLD = 3
+
+    async def scenario():
+        for i in range(12):
+            await md.quotes([f"SYM{i}"])       # distinct keys defeat the cache
+
+    run(scenario())
+    assert md.circuit_open
+    assert broken.calls == 3, f"provider was called {broken.calls} times after failing"
+    assert md.degraded
+
+
+def test_circuit_breaker_stays_closed_for_a_healthy_provider():
+    md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
+
+    async def scenario():
+        for sym in ("SPY", "QQQ", "AAPL", "NVDA", "TSLA"):
+            await md.quotes([sym])
+
+    run(scenario())
+    assert not md.circuit_open
+    assert not md.degraded
+
+
+def test_a_success_resets_the_failure_count():
+    md = MarketData(DemoProvider(as_of=date(2026, 8, 31)), fallback=True)
+    md._consecutive_failures = 2
+    run(md.quotes(["SPY"]))
+    assert md._consecutive_failures == 0
+
+
+def test_circuit_breaker_still_serves_usable_data():
+    """Tripping the breaker must degrade the app, never break it."""
+    md = MarketData(CountingBrokenProvider(), fallback=True)
+    md.FAILURE_THRESHOLD = 2
+
+    async def scenario():
+        for i in range(6):
+            await md.quotes([f"S{i}"])
+        return (await md.quotes(["SPY"]), await md.history("SPY", 120),
+                await md.expirations("SPY"))
+
+    quotes, bars, exps = run(scenario())
+    assert "SPY" in quotes and quotes["SPY"].last > 0
+    assert len(bars) > 60
+    assert exps
+
+
+def test_breaker_is_disabled_without_a_fallback():
+    """With no fallback there is nothing to fail over to, so keep trying."""
+    broken = CountingBrokenProvider()
+    md = MarketData(broken, fallback=False)
+    md.FAILURE_THRESHOLD = 2
+
+    async def scenario():
+        for i in range(5):
+            await md.quotes([f"S{i}"])
+
+    run(scenario())
+    assert broken.calls == 5

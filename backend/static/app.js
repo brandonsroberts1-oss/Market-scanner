@@ -125,6 +125,7 @@ async function loadStatus() {
     const dot = $('#statusChip .dot');
     dot.className = 'dot' + (s.provider === 'demo' || s.degraded ? ' sim' : s.realtime ? '' : ' delayed');
     const quality = s.provider === 'demo' ? 'SIMULATED DATA'
+      : s.degraded ? 'SIMULATED FALLBACK'
       : s.realtime ? 'real-time' : 'delayed';
     $('#statusText').textContent = `${s.provider} · ${quality}`;
     $('#statusChip').title = s.data_note;
@@ -199,6 +200,9 @@ async function runScan(save = false) {
     const result = await api(`/api/scan?${params}`);
     state.scan = result;
     renderScan(result);
+    // A scan can be the first thing that discovers the provider is down, so
+    // re-read status to keep the header chip truthful.
+    if (result.degraded && !state.status?.degraded) loadStatus();
     if (save) toast(`Scan saved (#${result.saved_scan_id})`, 'success');
   } catch (err) {
     $('#scanBody').innerHTML = `<tr><td colspan="14"><div class="empty">Scan failed: ${esc(err.message)}</div></td></tr>`;

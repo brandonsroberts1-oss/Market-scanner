@@ -75,6 +75,10 @@ async def status():
 
 
 def _data_note(md: MarketData) -> str:
+    if md.degraded and md.name != "demo":
+        return (f"The {md.name} provider is not responding, so some or all data is coming "
+                "from the offline simulator. Those prices are generated, not real - do not "
+                "trade off them. Check your network or API token.")
     if md.name == "demo":
         return ("Running on the offline simulator. Prices are generated, not real. "
                 "Set TRADIER_TOKEN or switch MARKET_DATA_PROVIDER to yahoo for live data.")
