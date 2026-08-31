@@ -29,6 +29,14 @@ Open the unzipped folder.
 That's it. A black window opens and does everything for you — builds the
 environment, installs what it needs, starts the app and opens your browser.
 
+> **Mac, first time only.** Unzipping strips the "this is a program" flag, so
+> macOS may open the file in TextEdit or refuse to run it. Two one-time fixes:
+> right-click the file → **Open** → **Open** (this clears the "unidentified
+> developer" warning), and if it still opens as text, open **Terminal**, type
+> `chmod +x ` (with the trailing space), drag the `Start Market Scanner.command`
+> file into the Terminal window, and press Enter. Double-click works from then on.
+> Cloning with `git` instead of downloading the ZIP avoids this entirely.
+
 The first run takes a minute or two while it downloads dependencies. Every run
 after that takes about two seconds. When it's ready you'll see:
 
