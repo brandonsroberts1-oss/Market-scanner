@@ -60,7 +60,7 @@ class YahooProvider:
                 if r.status_code == 200 and r.text and "<" not in r.text:
                     self._crumb = r.text.strip()
             except httpx.HTTPError as exc:
-                log.warning("yahoo crumb fetch failed: %s", exc)
+                log.debug("yahoo crumb fetch failed: %s", exc)
             return self._crumb
 
     async def _get_json(self, url: str, params: dict | None = None, crumb: bool = False) -> dict | None:
@@ -73,12 +73,12 @@ class YahooProvider:
             try:
                 r = await self._client.get(url, params=params)
             except httpx.HTTPError as exc:
-                log.warning("yahoo request failed %s: %s", url, exc)
+                log.debug("yahoo request failed %s: %s", url, exc)
                 return None
             if r.status_code in (401, 403) and attempt == 0:
                 continue                  # stale crumb - refresh and retry once
             if r.status_code != 200:
-                log.warning("yahoo %s -> HTTP %s", url, r.status_code)
+                log.debug("yahoo %s -> HTTP %s", url, r.status_code)
                 return None
             try:
                 return r.json()
@@ -102,7 +102,7 @@ class YahooProvider:
             if isinstance(res, Quote):
                 out[sym.upper()] = res
             elif isinstance(res, Exception):
-                log.warning("yahoo quote %s failed: %s", sym, res)
+                log.debug("yahoo quote %s failed: %s", sym, res)
         return out
 
     async def _quote_one(self, symbol: str) -> Quote | None:

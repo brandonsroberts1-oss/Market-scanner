@@ -8,8 +8,92 @@ in a persistent paper account or test the rules over history.
 Built for the 0–3 day horizon: same-day and few-day expiries, where liquidity
 and time decay matter as much as direction.
 
-![Dashboard](docs/screenshot-dashboard.png)
-*Market overview: index tiles, a plain-language read of the tape, headlines scored for tone and impact, and the scheduled catalyst calendar.*
+## Quick start — no terminal needed
+
+**1. Get the code onto your computer.**
+On the repository page on GitHub, click the green **Code** button → **Download ZIP**.
+Then **unzip it** (right-click → Extract All on Windows, double-click on Mac).
+Open the unzipped folder.
+
+> Make sure you actually extract the ZIP. Double-clicking a launcher *inside*
+> a zipped folder will not work on Windows.
+
+**2. Double-click the launcher for your computer:**
+
+| Your computer | Double-click this file |
+|---|---|
+| **Windows** | `Start Market Scanner.bat` |
+| **Mac** | `Start Market Scanner.command` |
+| **Linux** | `Start Market Scanner.command` (or run `./run.sh`) |
+
+That's it. A black window opens and does everything for you — builds the
+environment, installs what it needs, starts the app and opens your browser.
+
+The first run takes a minute or two while it downloads dependencies. Every run
+after that takes about two seconds. When it's ready you'll see:
+
+```
+  ----------------------------------------------------------
+   Market Scanner is running:   http://127.0.0.1:8000
+  ----------------------------------------------------------
+```
+
+**To stop the app**, close that black window (or press Ctrl+C in it).
+
+### If Python isn't installed
+
+The launcher checks for you and says so. Install Python 3.10 or newer from
+<https://www.python.org/downloads/>, then double-click the launcher again.
+
+> **Windows users:** on the first screen of the Python installer, tick
+> **"Add python.exe to PATH"** before clicking Install. This is the single most
+> common reason the launcher can't find Python afterwards.
+
+### Troubleshooting
+
+| What you see | What to do |
+|---|---|
+| A window flashes open and vanishes instantly | You're probably running it from inside the ZIP. Extract the folder first, then double-click. |
+| "Python is not installed (or is too old)" | Install Python 3.10+ from the link above; on Windows tick "Add python.exe to PATH". |
+| Mac: *"cannot be opened because it is from an unidentified developer"* | Right-click `Start Market Scanner.command` → **Open** → **Open**. You only need to do this once. |
+| Mac: the file opens in a text editor instead of running | Open Terminal in the folder and run `chmod +x "Start Market Scanner.command"` once. |
+| "Could not install the dependencies" | Usually no internet, or a work firewall/proxy blocking `pypi.org`. Try another network. |
+| The browser doesn't open on its own | Copy the `http://127.0.0.1:8000` address from the window into your browser. |
+| Port 8000 was busy | The launcher picks the next free port automatically and prints it — use that address. |
+
+Prefer a terminal? `./run.sh` (Mac/Linux) or `python launcher.py` (anywhere)
+does the same thing. For more detail while troubleshooting, set
+`MARKET_SCANNER_VERBOSE=1` to see the full server log.
+
+### Getting live data
+
+With no configuration the app starts on the offline simulator, so you can
+explore every screen immediately — but **those prices are generated, not real**,
+and the header says so in red.
+
+Copy `.env.example` to `.env` and pick a provider:
+
+| Provider | Key needed | Equity quotes | Option chains | Greeks |
+|---|---|---|---|---|
+| **Tradier** *(recommended)* | free token | real-time¹ | real-time¹ | exchange-published |
+| **Yahoo** *(default, no key)* | none | near-real-time | ~15 min delayed | computed locally |
+| **Demo** | none | simulated | simulated | computed locally |
+
+¹ A Tradier *sandbox* token returns delayed data. Real-time requires a
+brokerage account token. The app reports which it is in the status chip and
+never claims data is live when it isn't.
+
+```bash
+# .env
+MARKET_DATA_PROVIDER=tradier
+TRADIER_TOKEN=your_token_here
+```
+
+Get a free Tradier developer token at <https://developer.tradier.com/>.
+
+With Yahoo, the app re-solves implied volatility from the live bid/ask midpoint
+rather than trusting Yahoo's own IV field, which is frequently stale, and
+computes greeks itself.
 
 ---
 
@@ -53,47 +137,8 @@ a total loss.
 ![Paper trading](docs/screenshot-paper.png)
 *A paper session started with $100,000: live marks, equity curve, open positions, closed-trade statistics and the full order history.*
 
----
-
-## Quick start
-
-```bash
-git clone <this repo> && cd Market-scanner
-./run.sh
-```
-
-Then open <http://127.0.0.1:8000>.
-
-`run.sh` creates the virtualenv and installs dependencies on first run. Python
-3.11+ is required. With no configuration at all the app starts on the offline
-simulator, so you can explore every screen immediately — but those prices are
-generated, not real, and the header says so in red.
-
-### Getting live data
-
-Copy `.env.example` to `.env` and pick a provider:
-
-| Provider | Key needed | Equity quotes | Option chains | Greeks |
-|---|---|---|---|---|
-| **Tradier** *(recommended)* | free token | real-time¹ | real-time¹ | exchange-published |
-| **Yahoo** *(default, no key)* | none | near-real-time | ~15 min delayed | computed locally |
-| **Demo** | none | simulated | simulated | computed locally |
-
-¹ A Tradier *sandbox* token returns delayed data. Real-time requires a
-brokerage account token. The app reports which it is in the status chip and
-never claims data is live when it isn't.
-
-```bash
-# .env
-MARKET_DATA_PROVIDER=tradier
-TRADIER_TOKEN=your_token_here
-```
-
-Get a free Tradier developer token at <https://developer.tradier.com/>.
-
-With Yahoo, the app re-solves implied volatility from the live bid/ask midpoint
-rather than trusting Yahoo's own IV field, which is frequently stale, and
-computes greeks itself.
+![Dashboard](docs/screenshot-dashboard.png)
+*Market overview: index tiles, a plain-language read of the tape, headlines scored for tone and impact, and the scheduled catalyst calendar.*
 
 ---
 
@@ -213,6 +258,12 @@ evidence that no lookahead is inflating results.
 ## Project layout
 
 ```
+Start Market Scanner.bat      double-click launcher (Windows)
+Start Market Scanner.command  double-click launcher (Mac/Linux)
+launcher.py                   what those launchers run: builds the
+                              environment, starts the server, opens the browser
+run.sh                        terminal equivalent
+
 backend/
 ├── main.py               FastAPI app and all routes
 ├── config.py             env/.env settings

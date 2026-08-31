@@ -50,10 +50,10 @@ class TradierProvider:
         try:
             r = await self._client.get(f"{self.base_url}{path}", params=params or {})
         except httpx.HTTPError as exc:
-            log.warning("tradier request failed %s: %s", path, exc)
+            log.debug("tradier request failed %s: %s", path, exc)
             return None
         if r.status_code != 200:
-            log.warning("tradier %s -> HTTP %s: %s", path, r.status_code, r.text[:200])
+            log.debug("tradier %s -> HTTP %s: %s", path, r.status_code, r.text[:200])
             return None
         try:
             return r.json()

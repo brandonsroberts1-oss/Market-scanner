@@ -110,9 +110,10 @@ class MarketData:
         if self._consecutive_failures >= self.FAILURE_THRESHOLD and not self.circuit_open:
             self._circuit_open_until = time.monotonic() + self.COOLDOWN_SECONDS
             log.warning(
-                "%s failed %d times in a row; skipping it for %.0fs and serving "
-                "simulated data", self.provider.name, self._consecutive_failures,
-                self.COOLDOWN_SECONDS,
+                "The %s data provider is not responding (%d failures in a row). "
+                "Serving SIMULATED prices for the next %.0f seconds - they are "
+                "generated, not real. Check your internet connection or API token.",
+                self.provider.name, self._consecutive_failures, self.COOLDOWN_SECONDS,
             )
 
     def _skip_provider(self) -> bool:
@@ -143,18 +144,18 @@ class MarketData:
                     else:
                         self._record_failure()
                 except Exception as exc:                   # noqa: BLE001
-                    log.warning("provider quotes failed: %s", exc)
+                    log.debug("provider quotes failed: %s", exc)
                     self._record_failure()
             missing = [s for s in symbols if s not in data]
             if missing and self.fallback:
                 self.degraded = True
-                log.info("falling back to simulated quotes for %s", ",".join(missing))
+                log.debug("falling back to simulated quotes for %s", ",".join(missing))
                 try:
                     for sym, quote in (await self.fallback.quotes(missing)).items():
                         quote.name = (quote.name or sym)
                         data[sym] = quote
                 except Exception as exc:                   # noqa: BLE001
-                    log.warning("fallback quotes failed: %s", exc)
+                    log.debug("fallback quotes failed: %s", exc)
             return data
 
         return await self.cache.get_or_set(key, settings.quote_ttl, load)
@@ -169,7 +170,7 @@ class MarketData:
                     bars = await self.provider.history(symbol, days, interval)
                     self._record_success() if len(bars) else self._record_failure()
                 except Exception as exc:                   # noqa: BLE001
-                    log.warning("provider history %s failed: %s", symbol, exc)
+                    log.debug("provider history %s failed: %s", symbol, exc)
                     self._record_failure()
             if len(bars) < 30 and self.fallback:
                 self.degraded = True
@@ -188,7 +189,7 @@ class MarketData:
                     exps = await self.provider.expirations(symbol)
                     self._record_success() if exps else self._record_failure()
                 except Exception as exc:                   # noqa: BLE001
-                    log.warning("provider expirations %s failed: %s", symbol, exc)
+                    log.debug("provider expirations %s failed: %s", symbol, exc)
                     self._record_failure()
             if not exps and self.fallback:
                 self.degraded = True
@@ -207,7 +208,7 @@ class MarketData:
                     chain = await self.provider.chain(symbol, expiration)
                     self._record_success() if chain else self._record_failure()
                 except Exception as exc:                   # noqa: BLE001
-                    log.warning("provider chain %s %s failed: %s", symbol, expiration, exc)
+                    log.debug("provider chain %s %s failed: %s", symbol, expiration, exc)
                     self._record_failure()
             if (chain is None or not chain.calls) and self.fallback:
                 self.degraded = True
@@ -225,7 +226,7 @@ class MarketData:
             try:
                 items = await self.provider.news(symbols, limit)
             except Exception as exc:                       # noqa: BLE001
-                log.warning("provider news failed: %s", exc)
+                log.debug("provider news failed: %s", exc)
                 items = []
             return items
 

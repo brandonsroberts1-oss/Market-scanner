@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -21,7 +22,11 @@ from .engine.universe import PRESETS, get_universe
 from .paper import engine as paper
 from .providers.registry import MarketData, build_provider
 
-logging.basicConfig(level=logging.INFO,
+# Per-symbol provider failures log at DEBUG: a vendor hiccup would otherwise
+# print one scary line per symbol, when the circuit breaker already prints a
+# single summary that says what is actually happening.
+_VERBOSE = os.environ.get("MARKET_SCANNER_VERBOSE", "").strip() not in ("", "0")
+logging.basicConfig(level=logging.DEBUG if _VERBOSE else logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("market_scanner")
 
