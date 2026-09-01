@@ -27,6 +27,12 @@
   <!-- ================= DASHBOARD ================= -->
   <section class="view active" id="view-dashboard">
     <div class="info-box" id="dataNotice" hidden></div>
+    <div id="diagPanel" hidden>
+      <div class="card">
+        <h2>Data source check <span class="sub">what each provider returned just now</span></h2>
+        <div id="diagBody"><div class="loading"><div class="spinner"></div>Probing…</div></div>
+      </div>
+    </div>
     <div class="grid cols-4" id="indexTiles"></div>
 
     <div class="card">

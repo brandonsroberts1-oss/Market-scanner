@@ -24,6 +24,8 @@ from typing import Any, Awaitable, Callable
 from ..config import settings
 from . import store
 from .base import Bars, NewsItem, OptionChain, Quote
+from .cboe import CboeProvider
+from .stooq import StooqProvider
 from .tradier import TradierProvider
 from .yahoo import YahooProvider
 
@@ -65,97 +67,183 @@ class TTLCache:
         return {"entries": len(self._data)}
 
 
-def build_provider(name: str | None = None):
-    """Instantiate the configured live provider.
+SIMULATED_NAMES = {"demo", "simulated", "fake", "offline"}
 
-    Only real market-data vendors can be selected. There is no offline or
-    demo option: see the module docstring.
-    """
-    name = (name or settings.provider_name or "auto").lower()
-    if name == "auto":
-        name = "tradier" if settings.tradier_token else "yahoo"
 
-    if name in ("demo", "simulated", "fake", "offline"):
-        raise ProviderUnavailable(
-            "Simulated market data is not available. Set MARKET_DATA_PROVIDER to "
-            "'tradier' (with TRADIER_TOKEN) or 'yahoo'."
-        )
+def _make(name: str):
     if name == "tradier":
         if not settings.tradier_token:
             raise ProviderUnavailable(
                 "MARKET_DATA_PROVIDER=tradier but TRADIER_TOKEN is not set. Add your "
-                "token to .env, or set MARKET_DATA_PROVIDER=yahoo to use the free feed."
+                "token to .env, or leave MARKET_DATA_PROVIDER=auto for the free feeds."
             )
         return TradierProvider(settings.tradier_token, settings.tradier_base_url,
                                risk_free=settings.risk_free_rate)
     if name == "yahoo":
         return YahooProvider(risk_free=settings.risk_free_rate)
-
+    if name == "cboe":
+        return CboeProvider()
+    if name == "stooq":
+        return StooqProvider()
     raise ProviderUnavailable(
-        f"Unknown MARKET_DATA_PROVIDER {name!r}. Valid values are 'auto', 'tradier' "
-        f"and 'yahoo'."
+        f"Unknown MARKET_DATA_PROVIDER {name!r}. Valid values are 'auto', 'tradier', "
+        f"'yahoo', 'cboe' and 'stooq', or a comma-separated list to try in order."
     )
 
 
-class MarketData:
-    """Caching facade over a live provider, backed by last-known-good data.
+def build_providers(name: str | None = None) -> list:
+    """Build the ordered list of live sources to try.
 
-    A circuit breaker sits in front of the vendor: when it is fully
-    unreachable, every call otherwise waits out its own timeout and a scan
-    rediscovers the same outage once per symbol. After a few consecutive
-    failures the vendor is skipped for a cooldown and requests are served from
-    the store instead.
+    Relying on one vendor is what made a Yahoo block look like "no data". The
+    default now chains several independent sources so a single one refusing
+    requests degrades coverage instead of emptying the screen:
+
+      * Tradier  - real-time, authenticated, used first when a token is set
+      * Yahoo    - quotes with extended hours, option chains, price history
+      * CBOE     - option chains and underlying prices, no key or crumb needed
+      * Stooq    - daily bars as plain CSV, no authentication at all
+
+    Only real vendors can be selected; there is no simulated option.
+    """
+    raw = (name or settings.provider_name or "auto").lower().strip()
+
+    if raw in SIMULATED_NAMES:
+        raise ProviderUnavailable(
+            "Simulated market data is not available. Leave MARKET_DATA_PROVIDER "
+            "as 'auto', or set it to 'tradier' (with TRADIER_TOKEN), 'yahoo', "
+            "'cboe' or 'stooq'."
+        )
+
+    if raw == "auto":
+        names = (["tradier"] if settings.tradier_token else []) + ["yahoo", "cboe", "stooq"]
+    else:
+        names = [n.strip() for n in raw.split(",") if n.strip()]
+        for n in names:
+            if n in SIMULATED_NAMES:
+                raise ProviderUnavailable(
+                    "Simulated market data is not available. Remove "
+                    f"{n!r} from MARKET_DATA_PROVIDER."
+                )
+
+    providers = []
+    errors = []
+    for n in names:
+        try:
+            providers.append(_make(n))
+        except ProviderUnavailable as exc:
+            errors.append(str(exc))
+    if not providers:
+        raise ProviderUnavailable(" ".join(errors) or "No usable data provider configured.")
+    return providers
+
+
+def build_provider(name: str | None = None):
+    """The primary provider. Kept for callers that want a single source."""
+    return build_providers(name)[0]
+
+
+class MarketData:
+    """Caching facade over an ordered chain of live sources.
+
+    Each request tries the sources in turn and takes the first usable answer,
+    recording which one supplied it. If every source fails, the persistent
+    last-known-good store serves the most recent REAL data, marked stale. If
+    even that is empty the symbol is reported as having no data - never filled
+    in with a generated number.
+
+    A per-source circuit breaker stops a dead vendor from being retried on
+    every symbol, which otherwise turns one outage into dozens of timeouts.
     """
 
     FAILURE_THRESHOLD = 3
     COOLDOWN_SECONDS = 60.0
 
-    def __init__(self, provider=None, use_store: bool = True):
-        self.provider = provider or build_provider()
+    def __init__(self, providers=None, use_store: bool = True):
+        if providers is None:
+            providers = build_providers()
+        elif not isinstance(providers, (list, tuple)):
+            providers = [providers]
+        self.providers = list(providers)
+        if not self.providers:
+            raise ProviderUnavailable("No data providers configured.")
+
         self.use_store = use_store
         self.cache = TTLCache()
-        self._consecutive_failures = 0
-        self._circuit_open_until = 0.0
 
-        # Symbols currently being served from the store, mapped to the age of
-        # the data. Reported to the UI so staleness is always visible.
+        self._failures: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+
         self.stale_symbols: dict[str, str] = {}
         self.missing_symbols: set[str] = set()
+        self.source_errors: dict[str, str] = {}
+        self.sources_used: set[str] = set()
+
+    # -- identity -----------------------------------------------------------
+    @property
+    def provider(self):
+        return self.providers[0]
 
     @property
     def name(self) -> str:
-        return self.provider.name
+        return "+".join(p.name for p in self.providers)
 
     @property
     def realtime(self) -> bool:
-        return bool(getattr(self.provider, "realtime", False))
+        return any(getattr(p, "realtime", False) for p in self.providers)
 
     @property
     def serving_stale(self) -> bool:
         return bool(self.stale_symbols)
 
-    # -- circuit breaker ----------------------------------------------------
+    # -- circuit breaker, per source ---------------------------------------
+    def _is_open(self, provider) -> bool:
+        return time.monotonic() < self._open_until.get(provider.name, 0.0)
+
     @property
     def circuit_open(self) -> bool:
-        return time.monotonic() < self._circuit_open_until
+        """True when every source is in cooldown."""
+        return all(self._is_open(p) for p in self.providers)
 
-    def _record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._circuit_open_until = 0.0
+    def _record_success(self, provider) -> None:
+        self._failures[provider.name] = 0
+        self._open_until[provider.name] = 0.0
+        self.source_errors.pop(provider.name, None)
+        self.sources_used.add(provider.name)
 
-    def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self.FAILURE_THRESHOLD and not self.circuit_open:
-            self._circuit_open_until = time.monotonic() + self.COOLDOWN_SECONDS
+    def _record_failure(self, provider, error: str | None = None) -> None:
+        count = self._failures.get(provider.name, 0) + 1
+        self._failures[provider.name] = count
+        if error:
+            self.source_errors[provider.name] = error
+        elif getattr(provider, "last_error", None):
+            self.source_errors[provider.name] = provider.last_error
+        if count >= self.FAILURE_THRESHOLD and not self._is_open(provider):
+            self._open_until[provider.name] = time.monotonic() + self.COOLDOWN_SECONDS
             log.warning(
-                "The %s data provider is not responding (%d failures in a row). "
-                "Falling back to the most recent data already fetched, and marking "
-                "it stale. Check your internet connection or API token.",
-                self.provider.name, self._consecutive_failures,
+                "Data source '%s' is not responding (%d failures in a row%s). "
+                "Skipping it for %.0fs and trying the other sources.",
+                provider.name, count,
+                f": {self.source_errors[provider.name]}"
+                if provider.name in self.source_errors else "",
+                self.COOLDOWN_SECONDS,
             )
 
-    def _skip_provider(self) -> bool:
-        return self.circuit_open
+    async def _try_each(self, call, accept, label: str):
+        """Run `call(provider)` across the chain, returning the first accepted result."""
+        for provider in self.providers:
+            if self._is_open(provider):
+                continue
+            try:
+                result = await call(provider)
+            except Exception as exc:                           # noqa: BLE001
+                log.debug("%s failed for %s: %s", provider.name, label, exc)
+                self._record_failure(provider, f"{type(exc).__name__}: {exc}")
+                continue
+            if accept(result):
+                self._record_success(provider)
+                return result, provider
+            self._record_failure(provider)
+        return None, None
 
     def _mark_stale(self, symbol: str, fetched_at: str) -> None:
         self.stale_symbols[symbol.upper()] = fetched_at
@@ -171,6 +259,7 @@ class MarketData:
     def reset_status(self) -> None:
         self.stale_symbols.clear()
         self.missing_symbols.clear()
+        self.sources_used.clear()
 
     # -- quotes -------------------------------------------------------------
     async def quotes(self, symbols: list[str]) -> dict[str, Quote]:
@@ -181,19 +270,30 @@ class MarketData:
 
         async def load():
             data: dict[str, Quote] = {}
-            if not self._skip_provider():
+            # Take what each source can supply, then ask the next one only for
+            # what is still missing.
+            for provider in self.providers:
+                outstanding = [s for s in symbols if s not in data]
+                if not outstanding or self._is_open(provider):
+                    continue
                 try:
-                    data = await self.provider.quotes(symbols)
-                    self._record_success() if data else self._record_failure()
+                    fetched = await provider.quotes(outstanding)
                 except Exception as exc:                       # noqa: BLE001
-                    log.debug("provider quotes failed: %s", exc)
-                    self._record_failure()
+                    log.debug("%s quotes failed: %s", provider.name, exc)
+                    self._record_failure(provider, f"{type(exc).__name__}: {exc}")
+                    continue
+                if fetched:
+                    self._record_success(provider)
+                    for symbol, quote in fetched.items():
+                        quote.source = provider.name
+                        data[symbol] = quote
+                else:
+                    self._record_failure(provider)
 
             for symbol, quote in data.items():
-                quote.source = self.provider.name
                 self._mark_fresh(symbol)
                 if self.use_store:
-                    store.put_quote(quote, self.provider.name)
+                    store.put_quote(quote, quote.source)
 
             for symbol in symbols:
                 if symbol in data:
@@ -226,18 +326,15 @@ class MarketData:
         store_key = f"bars:{symbol.upper()}:{interval}"
 
         async def load():
-            bars = Bars(symbol.upper(), [])
-            if not self._skip_provider():
-                try:
-                    bars = await self.provider.history(symbol, days, interval)
-                    self._record_success() if len(bars) else self._record_failure()
-                except Exception as exc:                       # noqa: BLE001
-                    log.debug("provider history %s failed: %s", symbol, exc)
-                    self._record_failure()
-
-            if len(bars) >= 30:
+            bars, provider = await self._try_each(
+                lambda p: p.history(symbol, days, interval),
+                lambda b: b is not None and len(b) >= 30,
+                f"history {symbol}",
+            )
+            if bars is not None and provider is not None:
+                self._mark_fresh(symbol)
                 if self.use_store:
-                    store.put(store_key, "bars", bars, symbol.upper(), self.provider.name)
+                    store.put(store_key, "bars", bars, symbol.upper(), provider.name)
                 return bars
 
             if self.use_store:
@@ -246,7 +343,7 @@ class MarketData:
                     self._mark_stale(symbol, hit[1])
                     return hit[0]
             self._mark_missing(symbol)
-            return bars
+            return Bars(symbol.upper(), [])
 
         return await self.cache.get_or_set(key, settings.history_ttl, load)
 
@@ -256,28 +353,22 @@ class MarketData:
         store_key = f"exp:{symbol.upper()}"
 
         async def load():
-            exps: list[str] = []
-            if not self._skip_provider():
-                try:
-                    exps = await self.provider.expirations(symbol)
-                    self._record_success() if exps else self._record_failure()
-                except Exception as exc:                       # noqa: BLE001
-                    log.debug("provider expirations %s failed: %s", symbol, exc)
-                    self._record_failure()
-
-            if exps:
+            exps, provider = await self._try_each(
+                lambda p: p.expirations(symbol),
+                lambda e: bool(e),
+                f"expirations {symbol}",
+            )
+            if exps and provider is not None:
                 if self.use_store:
-                    store.put(store_key, "expirations", exps, symbol.upper(),
-                              self.provider.name)
+                    store.put(store_key, "expirations", exps, symbol.upper(), provider.name)
                 return exps
 
             if self.use_store:
                 hit = store.get(store_key)
                 if hit and isinstance(hit[0], list):
                     self._mark_stale(symbol, hit[1])
-                    # Drop anything that has since expired: a cached list must
-                    # never offer a date that has already passed.
-                    from datetime import date, datetime, timezone
+                    # A remembered list must never offer a date already past.
+                    from datetime import datetime, timezone
                     today = datetime.now(timezone.utc).date()
                     return [e for e in hit[0]
                             if _safe_date(e) is not None and _safe_date(e) >= today]
@@ -290,18 +381,14 @@ class MarketData:
         store_key = f"chain:{symbol.upper()}:{expiration}"
 
         async def load():
-            chain = None
-            if not self._skip_provider():
-                try:
-                    chain = await self.provider.chain(symbol, expiration)
-                    self._record_success() if chain else self._record_failure()
-                except Exception as exc:                       # noqa: BLE001
-                    log.debug("provider chain %s %s failed: %s", symbol, expiration, exc)
-                    self._record_failure()
-
-            if chain and chain.calls:
+            chain, provider = await self._try_each(
+                lambda p: p.chain(symbol, expiration),
+                lambda c: c is not None and bool(c.calls),
+                f"chain {symbol} {expiration}",
+            )
+            if chain is not None and provider is not None:
                 if self.use_store:
-                    store.put(store_key, "chain", chain, symbol.upper(), self.provider.name)
+                    store.put(store_key, "chain", chain, symbol.upper(), provider.name)
                 return chain
 
             if self.use_store:
@@ -318,22 +405,22 @@ class MarketData:
         key = "n:" + ",".join(sorted(s.upper() for s in symbols)) + f":{limit}"
 
         async def load():
-            if self._skip_provider():
-                return []
-            try:
-                return await self.provider.news(symbols, limit)
-            except Exception as exc:                           # noqa: BLE001
-                log.debug("provider news failed: %s", exc)
-                return []
+            items, _ = await self._try_each(
+                lambda p: p.news(symbols, limit), lambda n: bool(n), "news")
+            return items or []
 
         return await self.cache.get_or_set(key, settings.news_ttl, load)
 
     # -- reporting ----------------------------------------------------------
     def data_status(self) -> dict:
-        """What the UI needs to tell the user how trustworthy this data is."""
+        """What the UI needs to explain how trustworthy this data is."""
         oldest = min(self.stale_symbols.values(), default=None)
         return {
             "provider": self.name,
+            "sources": [p.name for p in self.providers],
+            "sources_used": sorted(self.sources_used),
+            "sources_down": sorted(p.name for p in self.providers if self._is_open(p)),
+            "source_errors": dict(self.source_errors),
             "realtime": self.realtime,
             "provider_reachable": not self.circuit_open,
             "stale_symbols": sorted(self.stale_symbols),
@@ -344,7 +431,11 @@ class MarketData:
         }
 
     async def close(self) -> None:
-        await self.provider.close()
+        for provider in self.providers:
+            try:
+                await provider.close()
+            except Exception:                                   # noqa: BLE001
+                pass
 
 
 def _safe_date(value: str):

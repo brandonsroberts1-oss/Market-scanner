@@ -22,7 +22,8 @@ from .engine.universe import PRESETS, get_universe
 from . import market_hours
 from .paper import engine as paper
 from .providers import store
-from .providers.registry import MarketData, ProviderUnavailable, build_provider
+from .providers.registry import (MarketData, ProviderUnavailable, build_provider,
+                                 build_providers)
 
 # Per-symbol provider failures log at DEBUG: a vendor hiccup would otherwise
 # print one scary line per symbol, when the circuit breaker already prints a
@@ -41,7 +42,7 @@ state: dict = {}
 async def lifespan(app: FastAPI):
     init_db()
     try:
-        state["market"] = MarketData(build_provider())
+        state["market"] = MarketData(build_providers())
     except ProviderUnavailable as exc:
         log.error("Cannot start: %s", exc)
         raise
@@ -71,6 +72,16 @@ async def order_rejected_handler(request, exc: paper.OrderRejected):
 # --------------------------------------------------------------------------
 # Meta
 # --------------------------------------------------------------------------
+@app.get("/api/diagnostics")
+async def diagnostics(symbol: str = Query("AAPL")):
+    """Probe every data source and report exactly what each one returned."""
+    from .providers.diagnostics import run_diagnostics
+    report = await run_diagnostics(symbol)
+    payload = report.to_dict()
+    payload["current_status"] = market().data_status()
+    return payload
+
+
 @app.get("/api/status")
 async def status():
     md = market()
@@ -91,6 +102,15 @@ async def status():
 def _data_note(md: MarketData) -> str:
     """One sentence on how much to trust what is on screen."""
     stale = md.data_status()
+
+    if stale["missing_symbols"] and not stale["stale_count"]:
+        down = ", ".join(stale["sources_down"]) or "every source"
+        reasons = "; ".join(f"{k}: {v}" for k, v in stale["source_errors"].items())
+        return (f"No data could be fetched for {len(stale['missing_symbols'])} symbol(s). "
+                f"Not responding: {down}."
+                + (f" Reported: {reasons}." if reasons else "")
+                + " Run the diagnostics (see /api/diagnostics) to see what each "
+                  "source returned.")
     if stale["stale_count"]:
         return (f"The {md.name} provider is not responding for "
                 f"{stale['stale_count']} symbol(s), so the app is showing the most "

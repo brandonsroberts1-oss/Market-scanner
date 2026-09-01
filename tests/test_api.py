@@ -18,8 +18,8 @@ def client(tmp_path, monkeypatch):
     """
     from backend import config, main
     monkeypatch.setattr(config.settings, "db_path", str(tmp_path / "api.db"))
-    monkeypatch.setattr(main, "build_provider",
-                        lambda *a, **k: SimulatedProvider(as_of=AS_OF))
+    monkeypatch.setattr(main, "build_providers",
+                        lambda *a, **k: [SimulatedProvider(as_of=AS_OF)])
     db._initialised = False
     db.init_db(force=True)
     with TestClient(app) as c:

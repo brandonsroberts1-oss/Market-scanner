@@ -302,6 +302,20 @@ def open_browser_when_ready(url: str, process: subprocess.Popen) -> None:
     print()
 
 
+def run_diagnostics_mode(python: Path) -> int:
+    """`--diagnose`: report what every data source actually returns."""
+    step("Probing data sources...")
+    print()
+    result = subprocess.run(
+        [str(python), "-c",
+         "import asyncio;"
+         "from backend.providers.diagnostics import run_diagnostics, format_report;"
+         "print(format_report(asyncio.run(run_diagnostics())))"],
+        cwd=str(ROOT),
+    )
+    return result.returncode
+
+
 def main() -> int:
     banner()
     check_python()
@@ -318,6 +332,9 @@ def main() -> int:
     python = ensure_venv(venv_dir)
     install_dependencies(python, venv_dir)
     verify_install(python)
+
+    if "--diagnose" in sys.argv or "--diagnostics" in sys.argv:
+        return run_diagnostics_mode(python)
 
     port = find_free_port(int(os.environ.get("PORT", DEFAULT_PORT)))
     if port != DEFAULT_PORT:

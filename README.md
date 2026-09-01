@@ -57,6 +57,29 @@ The launcher checks for you and says so. Install Python 3.10 or newer from
 > **"Add python.exe to PATH"** before clicking Install. This is the single most
 > common reason the launcher can't find Python afterwards.
 
+### The app runs but shows "no data"
+
+Double-click **`Diagnose Data Sources`** (`.bat` on Windows, `.command` on Mac).
+It makes one real request to every source and prints what each returned — the
+HTTP status and a plain-language reading of it, so you can tell a rate limit
+from a firewall from a DNS problem.
+
+The same check is in the app: when data is missing, the notice at the top of the
+Dashboard has a **Check data sources** button.
+
+Common results:
+
+| What the check says | What it means |
+|---|---|
+| `429 rate limited` | Yahoo throttles unauthenticated use. Wait a few minutes; a Tradier token avoids it entirely. |
+| `403 forbidden` | The source is refusing your IP or user agent. The other sources should still work. |
+| `blocked (HTML returned)` | A consent screen or captcha instead of data — common on some networks and regions. |
+| `DNS failed` / `timed out` | A network problem on your machine: no internet, a VPN, or a firewall. |
+| Everything fails | Not a provider problem. Check the connection first. |
+
+If only Yahoo fails, the app keeps working from CBOE and Stooq — you lose
+extended-hours quotes but keep option chains and price history.
+
 ### Troubleshooting
 
 | What you see | What to do |
@@ -79,14 +102,23 @@ does the same thing. For more detail while troubleshooting, set
 The app needs a live data provider. With no configuration it uses Yahoo
 Finance, which needs no API key. Copy `.env.example` to `.env` to change it:
 
-| Provider | Key needed | Equity quotes | Extended hours | Option chains | Greeks |
+| Source | Key needed | Equity quotes | Extended hours | Option chains | History |
 |---|---|---|---|---|---|
-| **Tradier** *(recommended)* | free token | real-time¹ | yes | real-time¹ | exchange-published |
-| **Yahoo** *(default, no key)* | none | near-real-time | yes | ~15 min delayed | computed locally |
+| **Tradier** *(best)* | free token | real-time¹ | yes | real-time¹ | yes |
+| **Yahoo** | none | near-real-time | yes | ~15 min delayed | yes |
+| **CBOE** | none | delayed | no | ~15 min delayed | no |
+| **Stooq** | none | last close | no | no | yes |
 
 ¹ A Tradier *sandbox* token returns delayed data. Real-time requires a
 brokerage account token. The app reports which it is in the status chip and
 never claims data is live when it isn't.
+
+**By default the app uses all of them**, in that order, and takes the first
+usable answer for each request. Yahoo is a scraped endpoint that rate-limits
+and blocks; CBOE and Stooq need no key, no cookie and no crumb, so a Yahoo
+block degrades coverage instead of emptying the screen. Set
+`MARKET_DATA_PROVIDER` to a single name, or a comma-separated list, to control
+the order yourself.
 
 There is no offline or demo provider. See **Where the numbers come from** below.
 

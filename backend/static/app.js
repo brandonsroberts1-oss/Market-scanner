@@ -84,6 +84,63 @@ function esc(s) {
 
 function cls(v) { return v > 0 ? 'up' : v < 0 ? 'down' : 'dim'; }
 
+/** Probe every data source and show what each one returned. */
+async function runDiagnostics() {
+  $('#diagPanel').hidden = false;
+  $('#diagBody').innerHTML = '<div class="loading"><div class="spinner"></div>'
+    + 'Probing each data source…</div>';
+  try {
+    const r = await api('/api/diagnostics');
+    $('#diagBody').innerHTML = `
+      <p class="prose">${esc(r.summary)}</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Source</th><th>Result</th><th class="num">Time</th><th>What it means</th></tr></thead>
+        <tbody>${r.probes.map((p) => `
+          <tr>
+            <td>${esc(p.name)}<div class="tiny faint mono">${esc((p.url || '').slice(0, 62))}</div></td>
+            <td><span class="badge ${p.ok ? 'bullish' : 'bearish'}">${esc(p.verdict || (p.ok ? 'OK' : 'failed'))}</span></td>
+            <td class="num mono tiny">${p.elapsed_ms === null ? '—' : p.elapsed_ms + 'ms'}</td>
+            <td class="tiny dim">${esc(p.detail || '')}</td>
+          </tr>`).join('')}</tbody>
+      </table></div>
+      <div class="tiny faint" style="margin-top:10px">
+        Provider setting: ${esc(r.environment.provider_setting)} ·
+        Tradier token: ${r.environment.tradier_token_set ? 'set' : 'not set'}
+        ${r.environment.https_proxy ? ' · proxy: ' + esc(r.environment.https_proxy) : ''}
+      </div>`;
+  } catch (err) {
+    $('#diagBody').innerHTML = `<div class="empty">Diagnostics failed: ${esc(err.message)}</div>`;
+  }
+}
+
+/** One plain-language sentence about the state of the data, built from
+ *  scratch every time so repeated renders cannot stack messages. */
+function dataMessage(ds, providerName) {
+  const parts = [];
+  if (ds.stale_count) {
+    parts.push(`${ds.stale_count} symbol(s) could not be refreshed`
+      + `${providerName ? ' from ' + providerName : ''}, so their rows use the most `
+      + `recent real prices already fetched (${ds.stale_age}), marked STALE.`);
+  }
+  const missing = ds.missing_symbols || [];
+  if (missing.length) {
+    const shown = missing.slice(0, 12).join(', ');
+    parts.push(`No data at all for ${missing.length} symbol(s): ${shown}`
+      + `${missing.length > 12 ? ', …' : ''}.`);
+  }
+  const down = ds.sources_down || [];
+  if (down.length) {
+    const why = Object.entries(ds.source_errors || {})
+      .map(([k, v]) => `${k} (${v})`).join(', ');
+    parts.push(`Not responding: ${why || down.join(', ')}.`);
+  }
+  if (parts.length) {
+    parts.push('Nothing shown is simulated. Run "Start Market Scanner" with '
+      + '--diagnose, or open /api/diagnostics, to see what each source returned.');
+  }
+  return parts.join(' ');
+}
+
 /** The pre/post-market line under a price, the way a broker shows it: the
  *  regular price stays put and the extended print sits beneath it. */
 function extendedLine(q) {
@@ -168,20 +225,16 @@ async function loadDashboard() {
     // Say plainly why anything is marked stale, on the landing screen.
     const ds = brief.data || {};
     const notice = $('#dataNotice');
-    if (ds.stale_count || (ds.missing_symbols || []).length) {
-      notice.hidden = false;
-      const parts = [];
-      if (ds.stale_count) {
-        parts.push(`${ds.stale_count} symbol(s) could not be refreshed from `
-          + `${ds.provider}. Showing the most recent real prices already fetched `
-          + `(${ds.stale_age}), marked STALE. Nothing here is simulated.`);
-      }
-      if ((ds.missing_symbols || []).length) {
-        parts.push(`No data at all yet for ${ds.missing_symbols.join(', ')}.`);
-      }
-      notice.textContent = parts.join(' ');
-    } else {
-      notice.hidden = true;
+    const message = dataMessage(ds, ds.provider);
+    notice.textContent = '';
+    notice.hidden = !message;
+    if (message) {
+      notice.append(document.createTextNode(message + ' '));
+      const btn = document.createElement('button');
+      btn.className = 'btn sm';
+      btn.textContent = 'Check data sources';
+      btn.addEventListener('click', runDiagnostics);
+      notice.append(btn);
     }
     $('#narrative').textContent = brief.narrative || 'No summary available.';
 
@@ -257,20 +310,12 @@ function renderScan(r) {
     + ` · ${r.elapsed_seconds}s · ${fmt.ago(r.generated_at)}`
     + (r.market_session ? ` · ${r.market_session}` : '');
 
-  const ds = r.data_status || {};
+  // Build the message fresh each time. Appending to whatever was already in
+  // the element is what produced the duplicated "No data at all for..." text.
   const note = $('#scanNote');
-  if (ds.stale_count) {
-    note.hidden = false;
-    note.textContent = `${ds.stale_count} symbol(s) could not be refreshed from ${r.provider}, `
-      + `so their rows use the most recent real prices already fetched (${ds.stale_age}). `
-      + `Those rows are marked STALE. Nothing shown is simulated.`;
-  } else {
-    note.hidden = true;
-  }
-  if ((ds.missing_symbols || []).length) {
-    note.hidden = false;
-    note.textContent += ` No data at all for: ${ds.missing_symbols.join(', ')}.`;
-  }
+  const message = dataMessage(r.data_status || {}, r.provider);
+  note.textContent = message;
+  note.hidden = !message;
 
   if (!r.ideas.length) {
     $('#scanBody').innerHTML = '<tr><td colspan="14"><div class="empty">No setups cleared the filters. Try a wider universe, a longer DTE window, or a lower conviction floor.</div></td></tr>';

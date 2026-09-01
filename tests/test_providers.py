@@ -324,10 +324,11 @@ def test_circuit_breaker_stays_closed_for_a_healthy_provider(fresh_db):
 
 
 def test_a_success_resets_the_failure_count(fresh_db):
-    md = MarketData(SimulatedProvider(as_of=date(2026, 8, 31)), use_store=False)
-    md._consecutive_failures = 2
+    provider = SimulatedProvider(as_of=date(2026, 8, 31))
+    md = MarketData(provider, use_store=False)
+    md._failures[provider.name] = 2
     run(md.quotes(["SPY"]))
-    assert md._consecutive_failures == 0
+    assert md._failures[provider.name] == 0
 
 
 def test_breaker_still_serves_cached_data_while_open(fresh_db):
@@ -433,3 +434,120 @@ def test_scanner_only_uses_expirations_the_vendor_lists(fresh_db):
             f"does not list")
         for leg in idea["legs"]:
             assert leg["expiration"] in allowed
+
+
+# ---------------- multiple sources ----------------
+class OnlyQuotes:
+    """A source that can answer quotes but nothing else."""
+    name = "quotes-only"
+    realtime = False
+
+    def __init__(self):
+        self.quote_calls = 0
+
+    async def quotes(self, symbols):
+        self.quote_calls += 1
+        return {s.upper(): Quote(s.upper(), last=100.0, previous_close=99.0)
+                for s in symbols}
+
+    async def history(self, symbol, days=180, interval="1d"):
+        return Bars(symbol.upper(), [])
+
+    async def expirations(self, symbol):
+        return []
+
+    async def chain(self, symbol, expiration):
+        return None
+
+    async def news(self, symbols, limit=30):
+        return []
+
+    async def close(self):
+        return None
+
+
+def test_a_second_source_covers_what_the_first_cannot(fresh_db):
+    """A source that only does quotes must not starve history and chains."""
+    partial = OnlyQuotes()
+    full = SimulatedProvider(as_of=date(2026, 8, 31))
+    md = MarketData([partial, full], use_store=False)
+
+    quotes = run(md.quotes(["SPY"]))
+    assert quotes["SPY"].last == 100.0, "the first source should answer quotes"
+    assert quotes["SPY"].source == "quotes-only"
+
+    bars = run(md.history("SPY", 120))
+    assert len(bars) > 60, "history should fall through to the second source"
+    exps = run(md.expirations("SPY"))
+    assert exps and run(md.chain("SPY", exps[2])) is not None
+
+
+def test_a_dead_first_source_falls_through(fresh_db):
+    md = MarketData([BrokenProvider(), SimulatedProvider(as_of=date(2026, 8, 31))],
+                    use_store=False)
+    quotes = run(md.quotes(["SPY"]))
+    assert quotes["SPY"].source == "simulated"
+    assert len(run(md.history("SPY", 120))) > 60
+    assert not md.missing_symbols
+
+
+def test_partial_coverage_is_merged_across_sources(fresh_db):
+    """Each source is asked only for what the previous ones could not supply."""
+    class OnlySPY:
+        name = "spy-only"
+        realtime = False
+        async def quotes(self, symbols):
+            return {"SPY": Quote("SPY", last=766.95, previous_close=769.35)} \
+                if "SPY" in [s.upper() for s in symbols] else {}
+        async def history(self, s, days=180, interval="1d"): return Bars(s.upper(), [])
+        async def expirations(self, s): return []
+        async def chain(self, s, e): return None
+        async def news(self, s, limit=30): return []
+        async def close(self): return None
+
+    md = MarketData([OnlySPY(), SimulatedProvider(as_of=date(2026, 8, 31))],
+                    use_store=False)
+    quotes = run(md.quotes(["SPY", "AAPL"]))
+    assert quotes["SPY"].source == "spy-only"
+    assert quotes["AAPL"].source == "simulated"
+
+
+def test_one_dead_source_does_not_open_the_whole_circuit(fresh_db):
+    md = MarketData([BrokenProvider(), SimulatedProvider(as_of=date(2026, 8, 31))],
+                    use_store=False)
+    md.FAILURE_THRESHOLD = 2
+
+    async def scenario():
+        for i in range(6):
+            await md.quotes([f"S{i}"])
+
+    run(scenario())
+    assert md._is_open(md.providers[0]), "the dead source should be in cooldown"
+    assert not md._is_open(md.providers[1]), "the healthy source must stay in use"
+    assert not md.circuit_open, "the app is not down while a source still answers"
+
+
+def test_data_status_names_the_failing_source(fresh_db):
+    """The UI must be able to say which source failed and why."""
+    md = MarketData([BrokenProvider(), SimulatedProvider(as_of=date(2026, 8, 31))],
+                    use_store=False)
+    run(md.quotes(["SPY"]))
+    status = md.data_status()
+    assert "broken" in status["source_errors"], status
+    assert "upstream is down" in status["source_errors"]["broken"]
+    assert "simulated" in status["sources_used"]
+    assert status["sources"] == ["broken", "simulated"]
+
+
+def test_default_chain_includes_keyless_sources():
+    """Yahoo alone is a single point of failure; the default must not be."""
+    from backend.providers.registry import build_providers
+    names = [p.name for p in build_providers("auto")]
+    assert "yahoo" in names
+    assert "cboe" in names, "CBOE serves option chains with no key or crumb"
+    assert "stooq" in names, "Stooq serves daily bars with no authentication"
+
+
+def test_providers_can_be_listed_explicitly():
+    from backend.providers.registry import build_providers
+    assert [p.name for p in build_providers("cboe,stooq")] == ["cboe", "stooq"]
