@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import httpx
 
 from .. import market_hours
-from .ratelimit import RateLimiter
+from .ratelimit import RateLimiter, SourcePaused
 from .base import Bar, Bars, NewsItem, OptionChain, Quote
 
 log = logging.getLogger(__name__)
@@ -45,6 +45,9 @@ class StooqProvider:
         try:
             async with self.limiter:
                 response = await self._client.get(url)
+        except SourcePaused as exc:
+            self.last_error = str(exc)
+            return None
         except httpx.HTTPError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return None

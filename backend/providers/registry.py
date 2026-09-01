@@ -218,6 +218,15 @@ class MarketData:
             self.source_errors[provider.name] = error
         elif getattr(provider, "last_error", None):
             self.source_errors[provider.name] = provider.last_error
+
+        # A rate limit is definitive: the source has told us to stop. Retrying
+        # it for another 80 symbols only deepens the throttle and stalls the
+        # scan, so it goes into cooldown on the first one.
+        message = self.source_errors.get(provider.name, "")
+        if "429" in message or "rate limit" in message.lower():
+            count = max(count, self.FAILURE_THRESHOLD)
+            self._failures[provider.name] = count
+
         if count >= self.FAILURE_THRESHOLD and not self._is_open(provider):
             self._open_until[provider.name] = time.monotonic() + self.COOLDOWN_SECONDS
             log.warning(

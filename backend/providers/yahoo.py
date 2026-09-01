@@ -24,7 +24,7 @@ import httpx
 
 from .. import market_hours
 from ..analytics import blackscholes as bs
-from .ratelimit import RateLimiter, retry_after_seconds
+from .ratelimit import RateLimiter, SourcePaused, retry_after_seconds
 from .base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote
 
 log = logging.getLogger(__name__)
@@ -87,20 +87,22 @@ class YahooProvider:
             try:
                 async with self.limiter:
                     r = await self._client.get(url, params=params)
+            except SourcePaused as exc:
+                self.last_error = str(exc)
+                return None
             except httpx.HTTPError as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 log.debug("yahoo request failed %s: %s", url, exc)
                 return None
 
             if r.status_code == 429:
-                # Throttled. Pause the whole source, then retry once or twice
-                # rather than reporting the symbol as having no data.
+                # Throttled. Give up on this source immediately and let the
+                # others serve the request. Sleeping and retrying here is what
+                # turned a rate limit into a scan that never finished: every
+                # symbol waited out its own backoff, serially.
                 delay = retry_after_seconds(r.headers)
-                self.last_error = f"HTTP 429 (rate limited, waiting {delay:.0f}s)"
+                self.last_error = f"HTTP 429 rate limited (paused {delay:.0f}s)"
                 self.limiter.penalise(delay)
-                if attempt < 2:
-                    await asyncio.sleep(min(delay, 30.0))
-                    continue
                 return None
 
             if r.status_code in (401, 403) and attempt == 0:
@@ -213,9 +215,12 @@ class YahooProvider:
         returns bars outside the regular trading period; the latest of those is
         the extended-hours price.
         """
+        # One day of 5-minute bars is enough to find the latest extended-hours
+        # print. The previous 5d/1m request returned thousands of bars per
+        # symbol for a single number.
         data = await self._get_json(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            {"range": "5d", "interval": "1m", "includePrePost": "true"},
+            {"range": "1d", "interval": "5m", "includePrePost": "true"},
         )
         try:
             result = data["chart"]["result"][0]
@@ -371,8 +376,10 @@ class YahooProvider:
 
     # -- news ---------------------------------------------------------------
     async def news(self, symbols: list[str], limit: int = 30) -> list[NewsItem]:
+        # One request per symbol adds up fast on a throttled source, and a few
+        # names give a representative read of the tape.
         results = await asyncio.gather(
-            *(self._news_one(s, limit) for s in symbols[:12]), return_exceptions=True
+            *(self._news_one(s, limit) for s in symbols[:4]), return_exceptions=True
         )
         seen: set[str] = set()
         out: list[NewsItem] = []

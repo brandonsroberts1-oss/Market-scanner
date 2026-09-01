@@ -18,7 +18,7 @@ import httpx
 
 from .. import market_hours
 from .base import NewsItem, OptionChain, OptionContract, Quote, parse_occ
-from .ratelimit import RateLimiter
+from .ratelimit import RateLimiter, SourcePaused
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,9 @@ class CboeProvider:
         try:
             async with self.limiter:
                 response = await self._client.get(self._url(symbol))
+        except SourcePaused as exc:
+            self.last_error = str(exc)
+            return None
         except httpx.HTTPError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             log.debug("cboe request failed %s: %s", symbol, exc)
@@ -92,10 +95,15 @@ class CboeProvider:
         return payload
 
     async def quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        # Concurrent, bounded by the shared limiter. CBOE has no batch endpoint,
+        # so a sequential loop would make it too slow to carry a full scan.
+        import asyncio
+        payloads = await asyncio.gather(
+            *(self._payload(s) for s in symbols), return_exceptions=True)
+
         out: dict[str, Quote] = {}
-        for symbol in symbols:
-            payload = await self._payload(symbol)
-            if not payload:
+        for symbol, payload in zip(symbols, payloads):
+            if isinstance(payload, Exception) or not payload:
                 continue
             last = _f(payload.get("current_price")) or _f(payload.get("close"))
             if last is None:

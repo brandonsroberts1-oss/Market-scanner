@@ -15,10 +15,28 @@ const state = {
 
 /* ---------- helpers ---------- */
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
+  // Every request gets a deadline. Without one, a stalled backend leaves the
+  // page spinning with no way to tell whether it is working or hung.
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs || 90000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      ...options,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error(`The request took longer than ${Math.round(timeoutMs / 1000)}s `
+        + `and was stopped. The data provider is probably rate limiting — `
+        + `use "Check data sources" on the Dashboard.`);
+    }
+    throw err;
+  }
+  clearTimeout(timer);
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = null; }

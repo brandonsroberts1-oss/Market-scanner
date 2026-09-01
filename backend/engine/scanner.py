@@ -28,6 +28,11 @@ MAX_CONCURRENCY = 6
 # action, so they are fetched after ranking rather than for the whole universe.
 DEFAULT_CHAIN_BUDGET = 18
 
+# A scan returns within this many seconds no matter what the data sources do.
+# Whatever finished in time is reported; the rest is listed as unavailable. An
+# unbounded scan is worse than a partial one - it just spins.
+SCAN_DEADLINE_SECONDS = 45.0
+
 
 @dataclass
 class SymbolResult:
@@ -62,6 +67,36 @@ class ScanResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+async def _gather_within(coros: list, budget: float, label: str = "") -> list:
+    """Run everything concurrently, but never past `budget` seconds.
+
+    Tasks that have not finished are cancelled and reported as exceptions, so a
+    slow or throttled source costs coverage rather than making the whole scan
+    hang.
+    """
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    if not tasks:
+        return []
+    done, pending = await asyncio.wait(tasks, timeout=max(budget, 1.0))
+    if pending:
+        log.warning("%s: %d of %d did not finish within %.0fs; cancelling them",
+                    label or "scan", len(pending), len(tasks), budget)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    results = []
+    for task in tasks:
+        if task in pending:
+            results.append(TimeoutError(f"{label} timed out"))
+        else:
+            try:
+                results.append(task.result())
+            except Exception as exc:                       # noqa: BLE001
+                results.append(exc)
+    return results
 
 
 def _pick_expirations(expirations: list[str], min_dte: int, max_dte: int,
@@ -102,9 +137,23 @@ class Scanner:
         self.market.reset_status()
 
         # One batched request for the whole universe rather than one per name.
-        quotes = await self.market.quotes(symbols + BENCHMARKS)
+        # Under the deadline like everything else: this is the first thing a
+        # throttled source stalls on.
+        opening_budget = SCAN_DEADLINE_SECONDS * 0.35
+        try:
+            quotes = await asyncio.wait_for(
+                self.market.quotes(symbols + BENCHMARKS), timeout=opening_budget)
+        except asyncio.TimeoutError:
+            log.warning("quote fetch exceeded %.0fs; continuing without it",
+                        opening_budget)
+            quotes = {}
 
-        spy_bars = await self.market.history("SPY", 180)
+        try:
+            spy_bars = await asyncio.wait_for(
+                self.market.history("SPY", 180), timeout=opening_budget)
+        except asyncio.TimeoutError:
+            from ..providers.base import Bars
+            spy_bars = Bars("SPY", [])
         spy_closes = spy_bars.closes
 
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -114,8 +163,9 @@ class Scanner:
                 return await self._score_symbol(symbol, quotes.get(symbol.upper()),
                                                 spy_closes)
 
-        scored = await asyncio.gather(*(score_one(s) for s in symbols),
-                                      return_exceptions=True)
+        scored = await _gather_within(
+            [score_one(s) for s in symbols], SCAN_DEADLINE_SECONDS * 0.6,
+            label="scoring")
 
         errors: list[str] = []
         symbol_results: list[SymbolResult] = []
@@ -139,16 +189,25 @@ class Scanner:
                 await self._attach_option_ideas(result, min_dte, max_dte, today)
 
         if candidates:
-            await asyncio.gather(*(options_for(r) for r in candidates),
-                                 return_exceptions=True)
+            remaining = max(
+                5.0,
+                SCAN_DEADLINE_SECONDS
+                - (datetime.now(timezone.utc) - started).total_seconds())
+            await _gather_within([options_for(r) for r in candidates], remaining,
+                                 label="option chains")
 
         # -- news and catalysts ---------------------------------------------
         headlines: list[cat.ScoredHeadline] = []
-        if include_news:
-            top_symbols = [r.symbol for r in candidates[:8]]
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        if include_news and elapsed < SCAN_DEADLINE_SECONDS:
+            top_symbols = [r.symbol for r in candidates[:4]]
             try:
-                raw = await self.market.news(BENCHMARKS[:2] + top_symbols, 40)
+                raw = await asyncio.wait_for(
+                    self.market.news(BENCHMARKS[:1] + top_symbols, 40),
+                    timeout=max(3.0, SCAN_DEADLINE_SECONDS - elapsed))
                 headlines = cat.score_news(raw)
+            except asyncio.TimeoutError:
+                errors.append("news: timed out")
             except Exception as exc:                       # noqa: BLE001
                 log.warning("news fetch failed: %s", exc)
                 errors.append(f"news: {exc}")

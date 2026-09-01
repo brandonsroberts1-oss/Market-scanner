@@ -161,8 +161,11 @@ def test_retry_after_header_is_honoured():
     assert 15 <= fallback <= 35, "a missing header should still back off"
 
 
-def test_yahoo_retries_a_429_instead_of_reporting_no_data():
-    """A throttled request must be retried, not turned into 'no data'."""
+def test_a_429_gives_up_immediately_rather_than_sleeping():
+    """Sleeping and retrying per symbol is what made a scan never finish.
+
+    A rate limit is definitive: drop the source and let the others answer.
+    """
     from backend.providers.yahoo import YahooProvider
     calls = {"n": 0}
 
@@ -173,17 +176,104 @@ def test_yahoo_retries_a_429_instead_of_reporting_no_data():
         if "fc.yahoo.com" in url:
             return httpx.Response(200, text="ok")
         calls["n"] += 1
-        if calls["n"] == 1:
-            return httpx.Response(429, headers={"retry-after": "0"}, text="slow down")
-        return httpx.Response(200, json={"quoteResponse": {"result": [
-            {"symbol": "AAPL", "regularMarketPrice": 317.15,
-             "regularMarketPreviousClose": 319.70, "marketState": "REGULAR"}]}})
+        return httpx.Response(429, headers={"retry-after": "30"}, text="slow down")
 
     provider = YahooProvider()
     provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    quotes = run(provider.quotes(["AAPL"]))
-    assert "AAPL" in quotes, "the retry after a 429 should have succeeded"
-    assert calls["n"] == 2
+
+    started = time.monotonic()
+    assert run(provider.quotes(["AAPL"])) == {}
+    assert time.monotonic() - started < 2.0, "a 429 must not block on a sleep"
+    assert calls["n"] == 1, f"the request was retried {calls['n']} times"
+    assert provider.limiter.paused_for > 0, "the source should be paused"
+
+
+def test_one_429_puts_the_source_straight_into_cooldown(fresh_db):
+    """Retrying a throttled source for another 80 symbols deepens the throttle."""
+    class Throttled:
+        name = "throttled"
+        realtime = False
+        def __init__(self): self.calls = 0; self.last_error = None
+        async def quotes(self, symbols):
+            self.calls += 1
+            self.last_error = "HTTP 429 rate limited (paused 30s)"
+            return {}
+        async def history(self, s, days=180, interval="1d"):
+            from backend.providers.base import Bars
+            return Bars(s.upper(), [])
+        async def expirations(self, s): return []
+        async def chain(self, s, e): return None
+        async def news(self, s, limit=30): return []
+        async def close(self): return None
+
+    throttled = Throttled()
+    md = MarketData([throttled, CountingProvider()], use_store=False)
+
+    async def scenario():
+        for i in range(8):
+            await md.quotes([f"SYM{i}"])
+
+    run(scenario())
+    assert throttled.calls == 1, (
+        f"a throttled source was called {throttled.calls} times")
+    assert md._is_open(throttled)
+
+
+def test_the_app_works_when_yahoo_throttles_everything(fresh_db):
+    """The real failure: Yahoo rate limiting every request.
+
+    The other sources are independent of it, so a scan must still produce
+    results rather than hanging or coming back empty.
+    """
+    class AlwaysThrottled:
+        name = "yahoo"
+        realtime = False
+        def __init__(self): self.last_error = "HTTP 429 rate limited"
+        async def quotes(self, symbols): return {}
+        async def history(self, s, days=180, interval="1d"):
+            from backend.providers.base import Bars
+            return Bars(s.upper(), [])
+        async def expirations(self, s): return []
+        async def chain(self, s, e): return None
+        async def news(self, s, limit=30): return []
+        async def close(self): return None
+
+    backup = CountingProvider()
+    backup.name = "cboe"
+    md = MarketData([AlwaysThrottled(), backup], use_store=False)
+
+    started = time.monotonic()
+    result = run(Scanner(md).scan("core", 0, 3, min_conviction=20, limit=40,
+                                  include_news=False))
+    elapsed = time.monotonic() - started
+
+    assert result.ideas, "the scan produced nothing despite a working source"
+    assert result.equities
+    assert elapsed < 30, f"the scan took {elapsed:.0f}s"
+    assert not result.data_status["missing_symbols"]
+
+
+def test_a_scan_finishes_even_when_a_source_hangs(fresh_db):
+    """A stalled provider must cost coverage, not block the scan forever."""
+    import backend.engine.scanner as scanner_module
+
+    class Hanging(CountingProvider):
+        name = "hanging"
+        async def history(self, symbol, days=180, interval="1d"):
+            await asyncio.sleep(600)          # never returns
+
+    md = MarketData(Hanging(), use_store=False)
+    original = scanner_module.SCAN_DEADLINE_SECONDS
+    scanner_module.SCAN_DEADLINE_SECONDS = 3.0
+    try:
+        started = time.monotonic()
+        result = run(Scanner(md).scan("core", 0, 3, include_news=False))
+        elapsed = time.monotonic() - started
+    finally:
+        scanner_module.SCAN_DEADLINE_SECONDS = original
+
+    assert elapsed < 15, f"the scan hung for {elapsed:.0f}s"
+    assert isinstance(result.errors, list)
 
 
 # ---------------- capability routing ----------------

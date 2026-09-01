@@ -18,8 +18,21 @@ import time
 log = logging.getLogger(__name__)
 
 
+class SourcePaused(RuntimeError):
+    """Raised instead of waiting out a long throttle penalty.
+
+    Blocking every caller until a 30-second penalty expires is how a rate limit
+    turns into a scan that never finishes. Callers should treat this as "this
+    source is unavailable right now" and move on to another one.
+    """
+
+
 class RateLimiter:
     """Concurrency cap plus a minimum gap between request starts."""
+
+    # Waiting longer than this for a slot is never worth it: another source can
+    # answer sooner, and the caller has a deadline.
+    MAX_WAIT = 2.0
 
     def __init__(self, name: str, max_concurrent: int = 4, min_interval: float = 0.0):
         self.name = name
@@ -30,13 +43,28 @@ class RateLimiter:
         self._penalty_until = 0.0
 
     async def __aenter__(self):
+        # Check before queueing: if the source is serving a throttle penalty,
+        # say so immediately rather than holding the caller.
+        if self.paused_for > self.MAX_WAIT:
+            raise SourcePaused(
+                f"{self.name} is rate limited for another "
+                f"{self.paused_for:.0f}s")
+
         await self._sem.acquire()
-        async with self._lock:
-            now = time.monotonic()
-            # A 429 penalty applies to every caller, not just the one that hit it.
-            wait = max(self._next_allowed - now, self._penalty_until - now, 0.0)
-            self._next_allowed = max(now, self._next_allowed, self._penalty_until) \
-                + self.min_interval
+        try:
+            async with self._lock:
+                now = time.monotonic()
+                # A 429 penalty applies to every caller, not just the one that
+                # hit it.
+                wait = max(self._next_allowed - now, self._penalty_until - now, 0.0)
+                if wait > self.MAX_WAIT:
+                    raise SourcePaused(
+                        f"{self.name} is rate limited for another {wait:.0f}s")
+                self._next_allowed = max(now, self._next_allowed,
+                                         self._penalty_until) + self.min_interval
+        except BaseException:
+            self._sem.release()
+            raise
         if wait > 0:
             await asyncio.sleep(wait)
         return self

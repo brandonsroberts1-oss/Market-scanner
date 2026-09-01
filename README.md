@@ -140,6 +140,12 @@ hundreds. The scan is built to stay well under the limit:
 A 90-symbol scan went from roughly 450 requests to about 145 cold and 55 on a
 rescan.
 
+**If a source starts refusing anyway**, it is dropped on the first 429 rather
+than retried, and the others carry the scan. The app is fully usable with Yahoo
+unavailable: CBOE supplies quotes and option chains, Stooq supplies history.
+Every scan also has a hard deadline — whatever finished is reported and the rest
+is listed as unavailable, because a partial answer beats a page that spins.
+
 There is no offline or demo provider. See **Where the numbers come from** below.
 
 ```bash
