@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import httpx
 
 from .. import market_hours
+from .ratelimit import RateLimiter
 from .base import Bar, Bars, NewsItem, OptionChain, Quote
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class StooqProvider:
     realtime = False
 
     def __init__(self, timeout: float = 20.0):
+        self.limiter = RateLimiter("Stooq", 2, 0.25)
         self._client = httpx.AsyncClient(
             timeout=timeout, follow_redirects=True,
             headers={"User-Agent": UA, "Accept": "text/csv,*/*"},
@@ -41,7 +43,8 @@ class StooqProvider:
 
     async def _csv(self, url: str) -> list[dict] | None:
         try:
-            response = await self._client.get(url)
+            async with self.limiter:
+                response = await self._client.get(url)
         except httpx.HTTPError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return None

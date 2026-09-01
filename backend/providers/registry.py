@@ -172,6 +172,7 @@ class MarketData:
 
         self._failures: dict[str, int] = {}
         self._open_until: dict[str, float] = {}
+        self._order_cache: dict[str, list] = {}
 
         self.stale_symbols: dict[str, str] = {}
         self.missing_symbols: set[str] = set()
@@ -228,9 +229,41 @@ class MarketData:
                 self.COOLDOWN_SECONDS,
             )
 
-    async def _try_each(self, call, accept, label: str):
+    # Each source is good at different things, and asking the wrong one first
+    # costs requests. CBOE returns an entire option chain - every expiration
+    # and contract - in a single response, where Yahoo needs one request per
+    # expiration, so it leads for options. Yahoo leads for quotes because it is
+    # the only free source with pre- and post-market prices.
+    CAPABILITY_PREFERENCE = {
+        "quotes": ["tradier", "yahoo", "cboe", "stooq"],
+        "history": ["tradier", "yahoo", "stooq"],
+        "options": ["tradier", "cboe", "yahoo"],
+        "news": ["yahoo"],
+    }
+
+    def _ordered_for(self, capability: str) -> list:
+        """Sources for one capability, best-suited first, configured order kept
+        as the tie-break so an explicit MARKET_DATA_PROVIDER list still wins."""
+        cached = self._order_cache.get(capability)
+        if cached is not None:
+            return cached
+        preference = self.CAPABILITY_PREFERENCE.get(capability, [])
+
+        def rank(provider):
+            try:
+                return (preference.index(provider.name), 0)
+            except ValueError:
+                # Not ranked for this capability: keep it, but after the ones
+                # that are, in the order the user configured.
+                return (len(preference), self.providers.index(provider))
+
+        ordered = sorted(self.providers, key=rank)
+        self._order_cache[capability] = ordered
+        return ordered
+
+    async def _try_each(self, call, accept, label: str, capability: str = ""):
         """Run `call(provider)` across the chain, returning the first accepted result."""
-        for provider in self.providers:
+        for provider in (self._ordered_for(capability) if capability else self.providers):
             if self._is_open(provider):
                 continue
             try:
@@ -272,7 +305,7 @@ class MarketData:
             data: dict[str, Quote] = {}
             # Take what each source can supply, then ask the next one only for
             # what is still missing.
-            for provider in self.providers:
+            for provider in self._ordered_for("quotes"):
                 outstanding = [s for s in symbols if s not in data]
                 if not outstanding or self._is_open(provider):
                     continue
@@ -326,10 +359,22 @@ class MarketData:
         store_key = f"bars:{symbol.upper()}:{interval}"
 
         async def load():
+            # Daily bars only change once a day. If the store already holds
+            # bars through the latest completed session, use them and make no
+            # request at all - this is what keeps a 90-symbol rescan from
+            # issuing 90 requests and being throttled.
+            if self.use_store and interval == "1d":
+                cached = store.get(store_key)
+                if cached and isinstance(cached[0], Bars) and len(cached[0]) >= 30:
+                    from .. import market_hours
+                    newest = cached[0].bars[-1].date[:10]
+                    if newest >= market_hours.latest_completed_session().isoformat():
+                        return cached[0]
+
             bars, provider = await self._try_each(
                 lambda p: p.history(symbol, days, interval),
                 lambda b: b is not None and len(b) >= 30,
-                f"history {symbol}",
+                f"history {symbol}", capability="history",
             )
             if bars is not None and provider is not None:
                 self._mark_fresh(symbol)
@@ -356,7 +401,7 @@ class MarketData:
             exps, provider = await self._try_each(
                 lambda p: p.expirations(symbol),
                 lambda e: bool(e),
-                f"expirations {symbol}",
+                f"expirations {symbol}", capability="options",
             )
             if exps and provider is not None:
                 if self.use_store:
@@ -384,7 +429,7 @@ class MarketData:
             chain, provider = await self._try_each(
                 lambda p: p.chain(symbol, expiration),
                 lambda c: c is not None and bool(c.calls),
-                f"chain {symbol} {expiration}",
+                f"chain {symbol} {expiration}", capability="options",
             )
             if chain is not None and provider is not None:
                 if self.use_store:
@@ -406,7 +451,8 @@ class MarketData:
 
         async def load():
             items, _ = await self._try_each(
-                lambda p: p.news(symbols, limit), lambda n: bool(n), "news")
+                lambda p: p.news(symbols, limit), lambda n: bool(n), "news",
+                capability="news")
             return items or []
 
         return await self.cache.get_or_set(key, settings.news_ttl, load)

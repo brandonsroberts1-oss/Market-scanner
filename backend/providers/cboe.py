@@ -18,6 +18,7 @@ import httpx
 
 from .. import market_hours
 from .base import NewsItem, OptionChain, OptionContract, Quote, parse_occ
+from .ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class CboeProvider:
     realtime = False          # delayed ~15 minutes
 
     def __init__(self, timeout: float = 20.0):
+        self.limiter = RateLimiter("CBOE", 4, 0.12)
         self._client = httpx.AsyncClient(
             timeout=timeout, follow_redirects=True,
             headers={"User-Agent": UA, "Accept": "application/json"},
@@ -66,7 +68,8 @@ class CboeProvider:
         if hit and time.monotonic() - hit[0] < 45:
             return hit[1]
         try:
-            response = await self._client.get(self._url(symbol))
+            async with self.limiter:
+                response = await self._client.get(self._url(symbol))
         except httpx.HTTPError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             log.debug("cboe request failed %s: %s", symbol, exc)

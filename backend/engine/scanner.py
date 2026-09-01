@@ -21,7 +21,12 @@ from .universe import BENCHMARKS, get_universe
 
 log = logging.getLogger(__name__)
 
-MAX_CONCURRENCY = 8
+MAX_CONCURRENCY = 6
+
+# How many symbols get an option chain fetched. Chains are the expensive call,
+# and a chain is only useful for a name that already scores well on price
+# action, so they are fetched after ranking rather than for the whole universe.
+DEFAULT_CHAIN_BUDGET = 18
 
 
 @dataclass
@@ -32,6 +37,8 @@ class SymbolResult:
     ideas: list[StrategyIdea] = field(default_factory=list)
     equity: EquityIdea | None = None
     error: str | None = None
+    bars: object | None = None      # carried from the scoring pass to the option pass
+    quote: object | None = None
 
 
 @dataclass
@@ -79,42 +86,66 @@ class Scanner:
 
     async def scan(self, preset: str = "core", min_dte: int = 0, max_dte: int = 3,
                    min_conviction: int = 0, limit: int = 40,
-                   include_news: bool = True) -> ScanResult:
+                   include_news: bool = True,
+                   chain_budget: int = DEFAULT_CHAIN_BUDGET) -> ScanResult:
+        """Score the universe on price data, then price options for the best of it.
+
+        Two passes on purpose. Free data endpoints throttle by IP, and fetching
+        an option chain for every symbol is what pushes a scan over the limit -
+        which shows up as "no data" even though each individual request works.
+        Scoring first means chains are only fetched for names that already look
+        worth trading.
+        """
         started = datetime.now(timezone.utc)
         symbols = get_universe(preset)
         today = started.date()
-        # Staleness is reported per scan, not accumulated across the session.
         self.market.reset_status()
 
-        # SPY history is needed by every symbol for beta and relative strength.
+        # One batched request for the whole universe rather than one per name.
+        quotes = await self.market.quotes(symbols + BENCHMARKS)
+
         spy_bars = await self.market.history("SPY", 180)
         spy_closes = spy_bars.closes
 
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-        async def run(symbol: str) -> SymbolResult:
+        async def score_one(symbol: str) -> SymbolResult:
             async with sem:
-                return await self._scan_symbol(symbol, spy_closes, min_dte, max_dte, today)
+                return await self._score_symbol(symbol, quotes.get(symbol.upper()),
+                                                spy_closes)
 
-        results = await asyncio.gather(*(run(s) for s in symbols), return_exceptions=True)
+        scored = await asyncio.gather(*(score_one(s) for s in symbols),
+                                      return_exceptions=True)
 
         errors: list[str] = []
         symbol_results: list[SymbolResult] = []
-        for symbol, res in zip(symbols, results):
+        for symbol, res in zip(symbols, scored):
             if isinstance(res, Exception):
                 log.warning("scan failed for %s: %s", symbol, res)
                 errors.append(f"{symbol}: {res}")
-            elif res.error:
+                continue
+            if res.error:
                 errors.append(f"{symbol}: {res.error}")
-                symbol_results.append(res)
-            else:
-                symbol_results.append(res)
+            symbol_results.append(res)
+
+        # -- second pass: options only for the strongest candidates ----------
+        candidates = [r for r in symbol_results
+                      if not r.error and r.assessment.conviction >= max(min_conviction, 1)]
+        candidates.sort(key=lambda r: r.assessment.conviction, reverse=True)
+        candidates = candidates[:max(chain_budget, 0)]
+
+        async def options_for(result: SymbolResult) -> None:
+            async with sem:
+                await self._attach_option_ideas(result, min_dte, max_dte, today)
+
+        if candidates:
+            await asyncio.gather(*(options_for(r) for r in candidates),
+                                 return_exceptions=True)
 
         # -- news and catalysts ---------------------------------------------
         headlines: list[cat.ScoredHeadline] = []
         if include_news:
-            top_symbols = [r.symbol for r in sorted(
-                symbol_results, key=lambda r: r.assessment.conviction, reverse=True)][:10]
+            top_symbols = [r.symbol for r in candidates[:8]]
             try:
                 raw = await self.market.news(BENCHMARKS[:2] + top_symbols, 40)
                 headlines = cat.score_news(raw)
@@ -123,7 +154,7 @@ class Scanner:
                 errors.append(f"news: {exc}")
 
         catalyst_list = cat.upcoming_catalysts(today, 10)
-        breadth = await self._breadth(symbol_results)
+        breadth = self._breadth(symbol_results, quotes)
         narrative = cat.market_narrative(headlines, catalyst_list, breadth)
 
         # -- collect ideas ---------------------------------------------------
@@ -165,66 +196,88 @@ class Scanner:
             elapsed_seconds=round((datetime.now(timezone.utc) - started).total_seconds(), 2),
         )
 
-    async def _scan_symbol(self, symbol: str, spy_closes: list[float],
-                           min_dte: int, max_dte: int, today: date) -> SymbolResult:
+    async def _score_symbol(self, symbol: str, quote, spy_closes: list[float]) -> SymbolResult:
+        """First pass: price history and signals only. No option requests."""
         try:
-            bars, quotes = await asyncio.gather(
-                self.market.history(symbol, 180), self.market.quotes([symbol])
-            )
-            quote = quotes.get(symbol.upper())
             if quote is None:
                 empty = Signals(symbol=symbol.upper(), price=0.0)
                 return SymbolResult(symbol, empty, assess(empty),
                                     error="no quote available from the data provider")
+
+            bars = await self.market.history(symbol, 180)
             if len(bars) < 25:
                 sig = build_signals(symbol, bars, quote)
                 return SymbolResult(symbol, sig, assess(sig), error="insufficient history")
 
-            expirations = await self.market.expirations(symbol)
-            targets = _pick_expirations(expirations, min_dte, max_dte, today)
-
-            # Score the symbol using the nearest qualifying expiry's chain, so
-            # the IV read matches the horizon actually being traded.
-            primary_chain = None
-            if targets:
-                primary_chain = await self.market.chain(symbol, targets[0])
-
-            sig = build_signals(symbol, bars, quote, primary_chain, spy_closes)
+            sig = build_signals(symbol, bars, quote, None, spy_closes)
             assessment = assess(sig)
             equity = rank_equity(sig, bars.closes)
-
-            ideas: list[StrategyIdea] = []
-            # Two expiries at most: the nearest and one further out in the
-            # window. More than that floods the table with near-duplicates.
-            for exp in targets[:2]:
-                chain = primary_chain if exp == targets[0] else await self.market.chain(symbol, exp)
-                if not chain or not chain.calls:
-                    continue
-                dte = (date.fromisoformat(exp) - today).days
-                ideas.extend(build_ideas(assessment, sig, chain, dte,
-                                         rate=settings.risk_free_rate))
-
-            ideas.sort(key=lambda i: i.score, reverse=True)
-            return SymbolResult(symbol, sig, assessment, ideas[:3], equity)
-
+            result = SymbolResult(symbol, sig, assessment, [], equity)
+            result.bars = bars
+            result.quote = quote
+            return result
         except Exception as exc:                           # noqa: BLE001
-            log.exception("scan_symbol %s failed", symbol)
+            log.exception("scoring %s failed", symbol)
             empty = Signals(symbol=symbol.upper(), price=0.0)
             return SymbolResult(symbol, empty, assess(empty), error=str(exc))
 
-    async def _breadth(self, results: list[SymbolResult]) -> dict:
-        """Advance/decline across the scanned names, plus index moves."""
-        quotes = await self.market.quotes(BENCHMARKS)
+    async def _attach_option_ideas(self, result: SymbolResult, min_dte: int,
+                                   max_dte: int, today: date) -> None:
+        """Second pass: fetch the chain for one symbol and build its structures."""
+        symbol = result.symbol
+        try:
+            expirations = await self.market.expirations(symbol)
+            targets = _pick_expirations(expirations, min_dte, max_dte, today)
+            if not targets:
+                return
+
+            primary_chain = await self.market.chain(symbol, targets[0])
+            if not primary_chain or not primary_chain.calls:
+                return
+
+            # Re-score with the chain in hand so implied vol informs the read.
+            # The quote came from the batched fetch in the first pass; asking
+            # for it again would be one more request per candidate.
+            quote = result.quote
+            bars = getattr(result, "bars", None)
+            if bars is not None and quote is not None:
+                result.signals = build_signals(symbol, bars, quote, primary_chain)
+                result.assessment = assess(result.signals)
+
+            ideas: list[StrategyIdea] = []
+            for exp in targets[:2]:
+                chain = (primary_chain if exp == targets[0]
+                         else await self.market.chain(symbol, exp))
+                if not chain or not chain.calls:
+                    continue
+                dte = (date.fromisoformat(exp) - today).days
+                ideas.extend(build_ideas(result.assessment, result.signals, chain, dte,
+                                         rate=settings.risk_free_rate))
+
+            ideas.sort(key=lambda i: i.score, reverse=True)
+            result.ideas = ideas[:3]
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("option ideas for %s failed: %s", symbol, exc)
+            result.error = result.error or f"options unavailable: {exc}"
+
+    def _breadth(self, results: list[SymbolResult], quotes: dict) -> dict:
+        """Advance/decline across the scanned names, plus index moves.
+
+        Uses the quotes already fetched for the scan rather than issuing more
+        requests for symbols that were just retrieved.
+        """
         from .. import market_hours
         advancers = sum(1 for r in results
                         if r.signals.change_pct is not None and r.signals.change_pct > 0)
         decliners = sum(1 for r in results
                         if r.signals.change_pct is not None and r.signals.change_pct < 0)
         spy = quotes.get("SPY")
+        indices = [quotes[s].to_dict() for s in BENCHMARKS if s in quotes]
         return {
             "advancers": advancers,
             "decliners": decliners,
-            "spy_change_pct": round(spy.change_pct, 2) if spy and spy.change_pct is not None else None,
-            "indices": [q.to_dict() for q in quotes.values()],
+            "spy_change_pct": round(spy.change_pct, 2)
+            if spy and spy.change_pct is not None else None,
+            "indices": indices,
             "market_session": market_hours.session_label(),
         }

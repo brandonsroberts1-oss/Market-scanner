@@ -24,6 +24,7 @@ import httpx
 
 from .. import market_hours
 from ..analytics import blackscholes as bs
+from .ratelimit import RateLimiter, retry_after_seconds
 from .base import Bar, Bars, NewsItem, OptionChain, OptionContract, Quote
 
 log = logging.getLogger(__name__)
@@ -36,7 +37,14 @@ class YahooProvider:
     name = "yahoo"
     realtime = False   # equities near-real-time, options delayed
 
-    def __init__(self, risk_free: float = 0.04, timeout: float = 15.0):
+    # Yahoo throttles unauthenticated use by IP. These values keep a full
+    # universe scan under the threshold; going faster is what produced
+    # "no data" while a single manual request still worked.
+    def __init__(self, risk_free: float = 0.04, timeout: float = 15.0,
+                 max_concurrent: int = 3, min_interval: float = 0.22):
+        self.limiter = RateLimiter("Yahoo", max_concurrent, min_interval)
+        self.last_error: str | None = None
+        self._exp_cache: dict[str, tuple[float, list[str]]] = {}
         self._client = httpx.AsyncClient(
             timeout=timeout,
             headers={"User-Agent": _UA, "Accept": "application/json"},
@@ -68,26 +76,44 @@ class YahooProvider:
                 log.debug("yahoo crumb fetch failed: %s", exc)
             return self._crumb
 
-    async def _get_json(self, url: str, params: dict | None = None, crumb: bool = False) -> dict | None:
+    async def _get_json(self, url: str, params: dict | None = None,
+                        crumb: bool = False) -> dict | None:
         params = dict(params or {})
-        for attempt in (0, 1):
+        for attempt in range(3):
             if crumb:
                 c = await self._ensure_crumb(force=attempt == 1)
                 if c:
                     params["crumb"] = c
             try:
-                r = await self._client.get(url, params=params)
+                async with self.limiter:
+                    r = await self._client.get(url, params=params)
             except httpx.HTTPError as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 log.debug("yahoo request failed %s: %s", url, exc)
                 return None
+
+            if r.status_code == 429:
+                # Throttled. Pause the whole source, then retry once or twice
+                # rather than reporting the symbol as having no data.
+                delay = retry_after_seconds(r.headers)
+                self.last_error = f"HTTP 429 (rate limited, waiting {delay:.0f}s)"
+                self.limiter.penalise(delay)
+                if attempt < 2:
+                    await asyncio.sleep(min(delay, 30.0))
+                    continue
+                return None
+
             if r.status_code in (401, 403) and attempt == 0:
                 continue                  # stale crumb - refresh and retry once
             if r.status_code != 200:
+                self.last_error = f"HTTP {r.status_code}"
                 log.debug("yahoo %s -> HTTP %s", url, r.status_code)
                 return None
             try:
+                self.last_error = None
                 return r.json()
             except ValueError:
+                self.last_error = "response was not JSON"
                 return None
         return None
 
@@ -104,15 +130,19 @@ class YahooProvider:
             return {}
 
         out: dict[str, Quote] = {}
-        data = await self._get_json(
-            "https://query1.finance.yahoo.com/v7/finance/quote",
-            {"symbols": ",".join(symbols)}, crumb=True,
-        )
-        rows = ((data or {}).get("quoteResponse") or {}).get("result") or []
-        for row in rows:
-            quote = self._quote_from_v7(row)
-            if quote:
-                out[quote.symbol] = quote
+        # One request per 50 symbols instead of one per symbol: a 90-name scan
+        # becomes 2 requests rather than 90.
+        for i in range(0, len(symbols), 50):
+            batch = symbols[i:i + 50]
+            data = await self._get_json(
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                {"symbols": ",".join(batch)}, crumb=True,
+            )
+            rows = ((data or {}).get("quoteResponse") or {}).get("result") or []
+            for row in rows:
+                quote = self._quote_from_v7(row)
+                if quote:
+                    out[quote.symbol] = quote
 
         missing = [s for s in symbols if s.upper() not in out]
         if missing:
@@ -258,6 +288,18 @@ class YahooProvider:
 
     # -- options ------------------------------------------------------------
     async def expirations(self, symbol: str) -> list[str]:
+        """Cached briefly in-process: chain() validates against this list, so an
+        uncached lookup would double every option request."""
+        import time
+        hit = self._exp_cache.get(symbol.upper())
+        if hit and time.monotonic() - hit[0] < 600:
+            return hit[1]
+        result = await self._expirations_uncached(symbol)
+        if result:
+            self._exp_cache[symbol.upper()] = (time.monotonic(), result)
+        return result
+
+    async def _expirations_uncached(self, symbol: str) -> list[str]:
         data = await self._get_json(
             f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}", crumb=True
         )

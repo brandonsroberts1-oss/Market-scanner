@@ -113,12 +113,32 @@ Finance, which needs no API key. Copy `.env.example` to `.env` to change it:
 brokerage account token. The app reports which it is in the status chip and
 never claims data is live when it isn't.
 
-**By default the app uses all of them**, in that order, and takes the first
-usable answer for each request. Yahoo is a scraped endpoint that rate-limits
-and blocks; CBOE and Stooq need no key, no cookie and no crumb, so a Yahoo
-block degrades coverage instead of emptying the screen. Set
-`MARKET_DATA_PROVIDER` to a single name, or a comma-separated list, to control
-the order yourself.
+**By default the app uses all of them**, routed by what each is best at:
+option chains from CBOE first (one response carries every expiration, where
+Yahoo needs a request per expiry), quotes from Yahoo first (the only free
+source with pre- and post-market prices), history from Yahoo then Stooq. Each
+request takes the first usable answer, so one source refusing degrades coverage
+instead of emptying the screen. Set `MARKET_DATA_PROVIDER` to a single name, or
+a comma-separated list, to control the order yourself.
+
+### Staying under the rate limits
+
+These endpoints throttle by IP, and that shows up in a confusing way: a single
+request succeeds while the app sees nothing, because the app was making
+hundreds. The scan is built to stay well under the limit:
+
+* **Quotes are batched** — one request covers up to 50 symbols, not one each.
+* **Two passes** — every symbol is scored on price history first, and option
+  chains are then fetched only for the top candidates (`chain_budget`,
+  default 18). Chains are the expensive call and only matter for names that
+  already score well.
+* **Daily bars come from the local store** when they already cover the latest
+  completed session, so a rescan makes no history requests at all.
+* **Requests are paced** per source, with a cap on how many are in flight, and
+  a 429 pauses that source and retries rather than reporting "no data".
+
+A 90-symbol scan went from roughly 450 requests to about 145 cold and 55 on a
+rescan.
 
 There is no offline or demo provider. See **Where the numbers come from** below.
 

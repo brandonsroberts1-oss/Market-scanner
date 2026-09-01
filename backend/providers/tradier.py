@@ -42,6 +42,8 @@ class TradierProvider:
         self.base_url = base_url.rstrip("/")
         self.realtime = "sandbox" not in self.base_url
         self.risk_free = risk_free
+        self.last_error: str | None = None
+        self._exp_cache: dict[str, tuple[float, list[str]]] = {}
         self._client = httpx.AsyncClient(
             timeout=timeout,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -152,6 +154,18 @@ class TradierProvider:
         return Bars(symbol.upper(), bars[-days:] if days else bars)
 
     async def expirations(self, symbol: str) -> list[str]:
+        """Cached briefly in-process: chain() validates against this list, so an
+        uncached lookup would double every option request."""
+        import time
+        hit = self._exp_cache.get(symbol.upper())
+        if hit and time.monotonic() - hit[0] < 600:
+            return hit[1]
+        result = await self._expirations_uncached(symbol)
+        if result:
+            self._exp_cache[symbol.upper()] = (time.monotonic(), result)
+        return result
+
+    async def _expirations_uncached(self, symbol: str) -> list[str]:
         data = await self._get("/markets/options/expirations",
                                {"symbol": symbol, "includeAllRoots": "true"})
         dates = ((data or {}).get("expirations") or {}).get("date")

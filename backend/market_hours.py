@@ -237,6 +237,20 @@ def last_regular_close(moment: datetime | None = None) -> datetime:
     return datetime.combine(day, regular_close_time(day), tzinfo=EASTERN)
 
 
+def latest_completed_session(moment: datetime | None = None) -> date:
+    """The most recent trading day whose regular session has finished.
+
+    This is the date of the newest daily bar that can exist. During a session
+    the latest complete bar is still yesterday's, so daily history fetched
+    earlier today is already current and does not need refetching.
+    """
+    now = now_eastern(moment)
+    today = now.date()
+    if is_trading_day(today) and now.time() >= regular_close_time(today):
+        return today
+    return previous_trading_day(today)
+
+
 def describe(moment: datetime | None = None) -> dict:
     """Everything the API needs to tell the user where the clock is."""
     now = now_eastern(moment)
