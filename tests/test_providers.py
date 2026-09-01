@@ -377,13 +377,15 @@ def test_tradier_without_a_token_is_an_explicit_error():
         config.settings.tradier_token = original
 
 
-def test_yahoo_is_the_default_without_a_token():
+def test_the_default_chain_leads_with_the_keyless_sources():
+    """Nothing may depend on Yahoo: it throttles, and the app has to work anyway."""
     from backend import config
-    from backend.providers.registry import build_provider
+    from backend.providers.registry import build_providers
     original = config.settings.tradier_token
     config.settings.tradier_token = ""
     try:
-        assert build_provider("auto").name == "yahoo"
+        names = [p.name for p in build_providers("auto")]
+        assert names == ["cboe", "stooq", "yahoo"], f"chain was {names}"
     finally:
         config.settings.tradier_token = original
 
