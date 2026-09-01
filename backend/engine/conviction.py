@@ -85,6 +85,13 @@ def assess(sig: Signals) -> Assessment:
         return Assessment(sig.symbol, 0.0, "neutral", 0, 0.0, 0.0, "unknown", "unknown",
                           [], ["Insufficient price history to score this symbol."])
 
+    if not sig.data_consistent:
+        # Scoring contradictory inputs produces confident nonsense. Better to
+        # decline and say why.
+        return Assessment(sig.symbol, 0.0, "neutral", 0, 0.0, 0.0, "unknown", "unknown",
+                          [], [sig.consistency_note or
+                               "Price history and quote disagree; not scored."])
+
     # -- directional factors ------------------------------------------------
     trend = _clamp((sig.trend_stack or 0.0))
     # A trend only counts when it is actually a trend: ADX below ~18 is chop.

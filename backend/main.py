@@ -82,6 +82,13 @@ async def diagnostics(symbol: str = Query("AAPL")):
     return payload
 
 
+@app.get("/api/selftest")
+async def selftest(symbol: str = Query("AAPL")):
+    """Run the real provider code and report what it managed to parse."""
+    from .providers.selftest import run_selftest
+    return (await run_selftest(symbol)).to_dict()
+
+
 @app.get("/api/status")
 async def status():
     md = market()

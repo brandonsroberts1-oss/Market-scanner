@@ -105,7 +105,8 @@ class CboeProvider:
         for symbol, payload in zip(symbols, payloads):
             if isinstance(payload, Exception) or not payload:
                 continue
-            last = _f(payload.get("current_price")) or _f(payload.get("close"))
+            last = (_f(payload.get("current_price")) or _f(payload.get("close"))
+                    or _f(payload.get("last_trade_price")) or _f(payload.get("prev_day_close")))
             if last is None:
                 continue
             prev = _f(payload.get("prev_day_close"))
@@ -142,7 +143,8 @@ class CboeProvider:
         if not payload:
             return None
 
-        spot = _f(payload.get("current_price")) or _f(payload.get("close"))
+        spot = (_f(payload.get("current_price")) or _f(payload.get("close"))
+                or _f(payload.get("last_trade_price")) or _f(payload.get("prev_day_close")))
         if not spot:
             return None
 
@@ -153,7 +155,11 @@ class CboeProvider:
             info = parse_occ(occ)
             if not info or info["expiration"] != expiration:
                 continue
-            if info["underlying"] != symbol.upper().replace(".", ""):
+            # Weekly and end-of-month series carry a suffixed root (SPXW for
+            # SPX, for instance). Requiring an exact match threw the chain away.
+            root = info["underlying"].replace(".", "").replace("-", "")
+            wanted = symbol.upper().replace(".", "").replace("-", "")
+            if not root.startswith(wanted):
                 continue
 
             contract = OptionContract(

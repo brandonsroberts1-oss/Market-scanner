@@ -115,7 +115,12 @@ def build_providers(name: str | None = None) -> list:
         )
 
     if raw == "auto":
-        names = (["tradier"] if settings.tradier_token else []) + ["yahoo", "cboe", "stooq"]
+        # CBOE and Stooq need no key, no cookie and no crumb, and neither
+        # throttles the way Yahoo does. Yahoo stays in the chain because it is
+        # the only free source of pre/post-market prices, but nothing depends
+        # on it: with Yahoo unavailable the app still scans, prices chains and
+        # ranks equities.
+        names = (["tradier"] if settings.tradier_token else []) + ["cboe", "stooq", "yahoo"]
     else:
         names = [n.strip() for n in raw.split(",") if n.strip()]
         for n in names:
@@ -244,8 +249,10 @@ class MarketData:
     # expiration, so it leads for options. Yahoo leads for quotes because it is
     # the only free source with pre- and post-market prices.
     CAPABILITY_PREFERENCE = {
+        # Yahoo leads for quotes only because of extended-hours prices; CBOE
+        # takes over the moment it throttles.
         "quotes": ["tradier", "yahoo", "cboe", "stooq"],
-        "history": ["tradier", "yahoo", "stooq"],
+        "history": ["tradier", "stooq", "yahoo"],
         "options": ["tradier", "cboe", "yahoo"],
         "news": ["yahoo"],
     }

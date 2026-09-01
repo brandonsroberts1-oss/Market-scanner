@@ -63,10 +63,61 @@ class ScanResult:
     narrative: str = ""
     breadth: dict = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    error_summary: dict = field(default_factory=dict)
+    diagnosis: str = ""
+    scored: int = 0
+    candidates: int = 0
     elapsed_seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _summarise_errors(errors: list[str]) -> dict:
+    """Group per-symbol errors by reason, so 17 identical failures read as one."""
+    grouped: dict[str, list[str]] = {}
+    for entry in errors:
+        symbol, _, reason = entry.partition(": ")
+        grouped.setdefault(reason.strip() or "unknown", []).append(symbol)
+    return {reason: {"count": len(symbols), "symbols": sorted(symbols)[:12]}
+            for reason, symbols in sorted(grouped.items(),
+                                          key=lambda kv: -len(kv[1]))}
+
+
+def _diagnose(symbols, results, candidates, ideas, errors) -> str:
+    """Say in one sentence why the table is empty, when it is.
+
+    An empty result has several very different causes - no data, no history,
+    nothing scoring high enough, no chains - and they need different responses
+    from the user. Leaving them to guess is what makes this frustrating.
+    """
+    if ideas:
+        return ""
+
+    scored = [r for r in results if not r.error]
+    reasons = _summarise_errors(errors)
+
+    if not results or not scored:
+        top = next(iter(reasons), None)
+        if top and "history" in top:
+            return (f"No symbol had enough price history to score. The data sources "
+                    f"returned no daily bars for {reasons[top]['count']} symbols. "
+                    f"Use 'Check data sources' - this is a data problem, not a "
+                    f"filter that is set too tight.")
+        if top:
+            return (f"No symbol could be scored. Most common reason: {top} "
+                    f"({reasons[top]['count']} symbols).")
+        return "No symbol could be scored and no reason was recorded."
+
+    if not candidates:
+        best = max((r.assessment.conviction for r in scored), default=0)
+        return (f"{len(scored)} symbols were scored, but none reached the conviction "
+                f"floor. The strongest read was {best}. Lower 'Min conviction' below "
+                f"that to see them.")
+
+    return (f"{len(candidates)} candidates were scored but no option chain could be "
+            f"priced for them - the chain source returned nothing for this expiry "
+            f"window. Try a wider DTE range, or use 'Check data sources'.")
 
 
 async def _gather_within(coros: list, budget: float, label: str = "") -> list:
@@ -248,10 +299,14 @@ class Scanner:
             data_status=self.market.data_status(),
             universe=symbols, min_dte=min_dte, max_dte=max_dte,
             ideas=ideas[:limit],
+            error_summary=_summarise_errors(errors),
+            diagnosis=_diagnose(symbols, symbol_results, candidates, ideas, errors),
+            scored=len([r for r in symbol_results if not r.error]),
+            candidates=len(candidates),
             equities=[e for e in equities if e["score"] > 0][:limit],
             headlines=[h.to_dict() for h in headlines[:25]],
             catalysts=[c.to_dict() for c in catalyst_list],
-            narrative=narrative, breadth=breadth, errors=errors[:20],
+            narrative=narrative, breadth=breadth, errors=errors[:40],
             elapsed_seconds=round((datetime.now(timezone.utc) - started).total_seconds(), 2),
         )
 
@@ -269,6 +324,10 @@ class Scanner:
                 return SymbolResult(symbol, sig, assess(sig), error="insufficient history")
 
             sig = build_signals(symbol, bars, quote, None, spy_closes)
+            if not sig.data_consistent:
+                return SymbolResult(symbol, sig, assess(sig),
+                                    error="price history and quote disagree "
+                                          "(different sources)")
             assessment = assess(sig)
             equity = rank_equity(sig, bars.closes)
             result = SymbolResult(symbol, sig, assessment, [], equity)

@@ -131,6 +131,36 @@ async function runDiagnostics() {
   }
 }
 
+/** Run every provider's real code and show what each one actually parsed.
+ *  A source can answer HTTP 200 and still be unusable if this app does not
+ *  understand the payload; only running the parser shows that. */
+async function runSelfTest() {
+  $('#diagPanel').hidden = false;
+  $('#diagBody').innerHTML = '<div class="loading"><div class="spinner"></div>'
+    + 'Running each provider\'s real code (this makes live requests)…</div>';
+  try {
+    const r = await api('/api/selftest', { timeoutMs: 180000 });
+    const rows = r.checks.map((c) => `
+      <tr>
+        <td class="mono">${esc(c.source)}</td>
+        <td>${esc(c.capability)}</td>
+        <td><span class="badge ${c.ok ? 'bullish' : 'bearish'}">${c.ok ? 'parsed' : 'nothing'}</span></td>
+        <td class="num mono">${c.count}</td>
+        <td class="tiny dim">${esc(c.sample || c.error || '')}${c.hint ? ' — ' + esc(c.hint) : ''}</td>
+      </tr>`).join('');
+    $('#diagBody').innerHTML = `
+      <p class="prose">${esc(r.verdict)}</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Source</th><th>Capability</th><th>Result</th><th class="num">Records</th><th>Detail</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <h3 style="margin-top:16px">Raw payload shape</h3>
+      <pre class="tiny faint" style="white-space:pre-wrap;overflow-x:auto">${esc(JSON.stringify(r.payload_keys, null, 2)).slice(0, 4000)}</pre>`;
+  } catch (err) {
+    $('#diagBody').innerHTML = `<div class="empty">Self-test failed: ${esc(err.message)}</div>`;
+  }
+}
+
 /** One plain-language sentence about the state of the data, built from
  *  scratch every time so repeated renders cannot stack messages. */
 function dataMessage(ds, providerName) {
@@ -253,6 +283,13 @@ async function loadDashboard() {
       btn.textContent = 'Check data sources';
       btn.addEventListener('click', runDiagnostics);
       notice.append(btn);
+      const deep = document.createElement('button');
+      deep.className = 'btn sm';
+      deep.style.marginLeft = '6px';
+      deep.textContent = 'Deep check';
+      deep.title = 'Run the real provider code and report what it could parse';
+      deep.addEventListener('click', runSelfTest);
+      notice.append(deep);
     }
     $('#narrative').textContent = brief.narrative || 'No summary available.';
 
@@ -336,7 +373,22 @@ function renderScan(r) {
   note.hidden = !message;
 
   if (!r.ideas.length) {
-    $('#scanBody').innerHTML = '<tr><td colspan="14"><div class="empty">No setups cleared the filters. Try a wider universe, a longer DTE window, or a lower conviction floor.</div></td></tr>';
+    const why = r.diagnosis
+      || 'No setups cleared the filters. Try a wider universe, a longer DTE window, '
+         + 'or a lower conviction floor.';
+    const breakdown = Object.entries(r.error_summary || {}).map(([reason, info]) =>
+      `<tr><td class="tiny">${esc(reason)}</td><td class="num mono">${info.count}</td>`
+      + `<td class="tiny faint">${esc((info.symbols || []).join(', '))}</td></tr>`).join('');
+    $('#scanBody').innerHTML = `<tr><td colspan="14">
+      <div class="empty" style="padding-bottom:6px">${esc(why)}</div>
+      <div class="tiny faint" style="text-align:center;margin-bottom:14px">
+        ${r.scored || 0} of ${r.universe.length} symbols scored ·
+        ${r.candidates || 0} reached the conviction floor
+      </div>
+      ${breakdown ? `<div class="table-wrap" style="max-width:760px;margin:0 auto 14px">
+        <table><thead><tr><th>Why symbols dropped out</th><th class="num">Count</th><th>Examples</th></tr></thead>
+        <tbody>${breakdown}</tbody></table></div>` : ''}
+    </td></tr>`;
     return;
   }
 

@@ -67,17 +67,24 @@ class StooqProvider:
             f"https://stooq.com/q/d/l/?s={_stooq_symbol(symbol)}&i=d")
         if not rows:
             return Bars(symbol.upper(), [])
+        parsed_any = False
 
         bars: list[Bar] = []
         for row in rows:
+            # Column case is not consistent across Stooq's endpoints.
+            lower = {(k or "").strip().lower(): v for k, v in row.items()}
             try:
                 bars.append(Bar(
-                    row["Date"], float(row["Open"]), float(row["High"]),
-                    float(row["Low"]), float(row["Close"]),
-                    float(row.get("Volume") or 0),
+                    lower["date"], float(lower["open"]), float(lower["high"]),
+                    float(lower["low"]), float(lower["close"]),
+                    float(lower.get("volume") or 0),
                 ))
+                parsed_any = True
             except (KeyError, TypeError, ValueError):
                 continue
+        if not parsed_any:
+            self.last_error = (f"received {len(rows)} CSV rows but none parsed; "
+                               f"columns were {list(rows[0].keys()) if rows else []}")
         return Bars(symbol.upper(), bars[-days:] if days else bars)
 
     async def quotes(self, symbols: list[str]) -> dict[str, Quote]:

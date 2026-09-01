@@ -79,6 +79,12 @@ class Signals:
     rel_strength_spy: float | None = None  # 10-day excess return vs SPY
     bars_available: int = 0
 
+    # True when the price history and the live quote agree. They can come from
+    # different providers, and a series that is split-unadjusted or stale
+    # against a current quote produces meaningless gaps and momentum.
+    data_consistent: bool = True
+    consistency_note: str | None = None
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -101,6 +107,20 @@ def build_signals(
         return s
 
     s.change_pct = _clean(quote.change_pct) if quote else None
+
+    # Cross-source sanity check before anything is derived from both.
+    if quote and closes:
+        reference = quote.previous_close or quote.last
+        if reference and closes[-1] > 0:
+            drift = abs(closes[-1] / reference - 1.0)
+            if drift > 0.15:
+                s.data_consistent = False
+                s.consistency_note = (
+                    f"Price history ends at {closes[-1]:.2f} but the quote implies "
+                    f"{reference:.2f} ({drift * 100:.0f}% apart). The two came from "
+                    f"different sources and disagree; signals derived from both are "
+                    f"unreliable."
+                )
 
     # -- trend --------------------------------------------------------------
     ema9, ema21, ema50 = ind.ema(closes, 9), ind.ema(closes, 21), ind.ema(closes, 50)
@@ -143,7 +163,8 @@ def build_signals(
     s.relative_volume = _clean(ind.relative_volume(volumes, 20))
     if len(volumes) >= 20:
         s.avg_dollar_volume = _clean(float(np.mean(volumes[-20:])) * price)
-    if len(closes) >= 2 and quote and quote.open:
+    # Only meaningful when the quote and the bar series are the same scale.
+    if len(closes) >= 2 and quote and quote.open and s.data_consistent:
         s.gap_pct = _clean((quote.open / closes[-2] - 1.0) * 100)
 
     # -- relative strength vs SPY ------------------------------------------

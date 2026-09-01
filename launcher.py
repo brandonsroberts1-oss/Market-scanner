@@ -310,7 +310,9 @@ def run_diagnostics_mode(python: Path) -> int:
         [str(python), "-c",
          "import asyncio;"
          "from backend.providers.diagnostics import run_diagnostics, format_report;"
-         "print(format_report(asyncio.run(run_diagnostics())))"],
+         "from backend.providers.selftest import run_selftest, format_selftest;"
+         "print(format_report(asyncio.run(run_diagnostics())));"
+         "print(format_selftest(asyncio.run(run_selftest())))"],
         cwd=str(ROOT),
     )
     return result.returncode

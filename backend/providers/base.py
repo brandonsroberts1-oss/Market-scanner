@@ -236,7 +236,7 @@ def occ_symbol(underlying: str, expiration: str, kind: str, strike: float) -> st
 def parse_occ(symbol: str) -> dict | None:
     """Inverse of `occ_symbol`; returns None if the symbol is not OCC-shaped."""
     import re
-    m = re.fullmatch(r"([A-Z]{1,6})(\d{6})([CP])(\d{8})", symbol.upper())
+    m = re.fullmatch(r"([A-Z][A-Z0-9.\-]{0,5})(\d{6})([CP])(\d{8})", symbol.upper())
     if not m:
         return None
     root, yymmdd, cp, strike = m.groups()
